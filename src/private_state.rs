@@ -106,8 +106,13 @@ pub fn state_root() -> Result<PathBuf> {
 
 /// The reader path: resolved lexically and never creating anything, so a
 /// refused connector can report why without leaving directories behind.
+/// Canonicalized like the writer path — a state root reached through a
+/// symlinked ancestor (macOS /tmp → /private/tmp, /var → /private/var)
+/// must read back the same directory the writer published into, or the
+/// link rejection would refuse a location the writer itself accepted.
 pub fn state_root_read_only() -> Result<PathBuf> {
-    resolved_state_root().map_err(|_| anyhow!("mcp_state_unavailable"))
+    let path = resolved_state_root().map_err(|_| anyhow!("mcp_state_unavailable"))?;
+    Ok(path.canonicalize().unwrap_or(path))
 }
 
 fn reject_links(path: &Path) -> Result<()> {
@@ -257,6 +262,45 @@ mod tests {
     use super::*;
     use std::env;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Mutex;
+
+    /// Serializes tests that install the process-global state-root override.
+    static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn reader_resolves_a_symlinked_state_root_like_the_writer() {
+        // macOS /tmp → /private/tmp: a state root reached through a
+        // symlinked ancestor must read back the directory the writer
+        // canonicalized into, not be refused by the link check on the
+        // lexical path.
+        let _guard = OVERRIDE_LOCK.lock().unwrap();
+        let base = env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mcp-reader-root-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&base).unwrap();
+        let link = base.with_file_name(format!(
+            "{}-link",
+            base.file_name().unwrap().to_string_lossy()
+        ));
+        symlink(&base, &link).unwrap();
+        let root = link.join("state");
+        fs::create_dir(&root).unwrap();
+
+        set_state_root_override(root.clone());
+        let writer = state_root().unwrap();
+        let reader = state_root_read_only().unwrap();
+        let expected = root.canonicalize().unwrap();
+        if let Ok(mut guard) = STATE_ROOT_OVERRIDE.write() {
+            *guard = None;
+        }
+        fs::remove_dir_all(&base).unwrap();
+        fs::remove_file(&link).unwrap();
+
+        assert_eq!(reader, writer);
+        assert_eq!(reader, expected);
+    }
+
     #[test]
     fn discovery_rejects_public_permissions_and_symlink_substitution() {
         let root = env::temp_dir().join(format!("mcp-private-fixture-{}", uuid::Uuid::new_v4()));
