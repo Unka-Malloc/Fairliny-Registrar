@@ -1,0 +1,138 @@
+# LicoUp subagent-mesh preset for `mcpd serve`.
+#
+# This is LicoUp's admitted remote surface as a declarative registration: the
+# five subagent tools routed to `licoup subagents execute --stdin-json` over
+# the licoup.stdio.v1 child protocol, `lico_subagent_cancel` on the reserved
+# control channel, and the caller set the adapter registry admits (the mesh
+# members, in provider-id order).
+#
+# Run it beside a LicoUp data root:
+#
+#   LICOUP_HOME=<licoup data root> MCPD_HOME=<any state root> \
+#       mcpd service start --config presets/licoup-subagents.toml
+#
+# Point an admitted caller at it with `mcpd connector --caller <provider>`
+# bound to the same MCPD_HOME. LICOUP_HOME must also be visible to the
+# backend so `licoup rpc stdio` resolves its own home — child sessions
+# inherit the real environment, per the environment-fidelity rule.
+#
+# Extending LicoUp's remote surface is additive: more functions mean more
+# `[[service]]` blocks (or more tools here), never engine changes. Read-only
+# inventory/probe calls and effect-bearing delegate/continue/cancel calls
+# keep their distinct admission semantics: `effect = true` marks a tool whose
+# outcome is uncertain after a mid-flight transport failure, so no connector
+# may replay it blindly; `control` keeps the cancellation channel unqueued
+# behind slow ordinary calls.
+
+[server]
+name = "lico-up-subagents"
+version = "0.14.0"
+
+# The caller-context channel LicoUp binds: session headers → caller scope.
+[[context]]
+attribute = "conversationId"
+header = "x-licoup-conversation-id"
+env = "LICOUP_MCP_CONVERSATION_ID"
+
+[[context]]
+attribute = "membershipId"
+header = "x-licoup-membership-id"
+env = "LICOUP_MCP_MEMBERSHIP_ID"
+
+[[context]]
+attribute = "parentDispatchId"
+header = "x-licoup-parent-dispatch-id"
+env = "LICOUP_MCP_PARENT_DISPATCH_ID"
+
+[[service]]
+name = "licoup-subagents"
+version = "1"
+# Mesh members the adapter registry admits as callers, in provider-id order.
+callers = ["antigravity", "claude-code", "codex", "cursor"]
+control = ["lico_subagent_cancel"]
+
+[service.backend]
+program = "licoup"
+args = ["rpc", "stdio"]
+protocol = "licoup.stdio.v1"
+workflow_id = "mcp-service"
+invoke = ["subagents", "execute", "--stdin-json", "{request}"]
+
+# Read-only inventory: no effect, no reserved channel.
+[[service.tools]]
+name = "lico_subagents_list"
+input_schema_json = '''
+{"type":"object","additionalProperties":false,"properties":{},"required":[]}
+'''
+
+# Read-only probe of one mesh member.
+[[service.tools]]
+name = "lico_subagent_probe"
+input_schema_json = '''
+{"type":"object","additionalProperties":false,
+ "properties":{"agentId":{"type":"string","minLength":1,"maxLength":256}},
+ "required":["agentId"]}
+'''
+
+# Effect-bearing dispatch: may create real subagent work; never replay after
+# an uncertain transport outcome.
+[[service.tools]]
+name = "lico_subagent_delegate"
+effect = true
+input_schema_json = '''
+{"type":"object","additionalProperties":false,
+ "properties":{
+  "conversationId":{"type":"string","minLength":1,"maxLength":256},
+  "membershipId":{"type":"string","minLength":1,"maxLength":256},
+  "agent":{"type":"string","minLength":1,"maxLength":256},
+  "prompt":{"type":"string","minLength":1,"maxLength":49152},
+  "model":{"type":"string","minLength":1,"maxLength":256},
+  "reasoningEffort":{"type":"string","minLength":1,"maxLength":32},
+  "taskType":{"type":"string","enum":["frontend","backend","retrieval","text"]},
+  "workingDirectory":{"type":"string","minLength":1,"maxLength":4096},
+  "timeoutMs":{"type":"integer","minimum":0,"maximum":1800000,
+               "x-zeroMeansPolicyDefault":true,"x-minFiniteTimeoutMs":1000},
+  "timeoutUnbounded":{"type":"boolean"},
+  "unboundedTimeout":{"type":"boolean"},
+  "maxStdoutBytes":{"type":"integer","minimum":65536,"maximum":67108864},
+  "maxStderrBytes":{"type":"integer","minimum":16384,"maximum":4194304}},
+ "required":["prompt"]}
+'''
+
+# Effect-bearing continuation of an admitted dispatch.
+[[service.tools]]
+name = "lico_subagent_continue"
+effect = true
+input_schema_json = '''
+{"type":"object","additionalProperties":false,
+ "properties":{
+  "conversationId":{"type":"string","minLength":1,"maxLength":256},
+  "membershipId":{"type":"string","minLength":1,"maxLength":256},
+  "agent":{"type":"string","minLength":1,"maxLength":256},
+  "prompt":{"type":"string","minLength":1,"maxLength":49152},
+  "model":{"type":"string","minLength":1,"maxLength":256},
+  "reasoningEffort":{"type":"string","minLength":1,"maxLength":32},
+  "taskType":{"type":"string","enum":["frontend","backend","retrieval","text"]},
+  "workingDirectory":{"type":"string","minLength":1,"maxLength":4096},
+  "timeoutMs":{"type":"integer","minimum":0,"maximum":1800000,
+               "x-zeroMeansPolicyDefault":true,"x-minFiniteTimeoutMs":1000},
+  "timeoutUnbounded":{"type":"boolean"},
+  "unboundedTimeout":{"type":"boolean"},
+  "maxStdoutBytes":{"type":"integer","minimum":65536,"maximum":67108864},
+  "maxStderrBytes":{"type":"integer","minimum":16384,"maximum":4194304}},
+ "required":["prompt"]}
+'''
+
+# Effect-bearing cancellation, reserved to the control channel so it never
+# queues behind a held ordinary call.
+[[service.tools]]
+name = "lico_subagent_cancel"
+effect = true
+input_schema_json = '''
+{"type":"object","additionalProperties":false,
+ "properties":{
+  "conversationId":{"type":"string","minLength":1,"maxLength":256},
+  "membershipId":{"type":"string","minLength":1,"maxLength":256},
+  "agent":{"type":"string","minLength":1,"maxLength":256}},
+ "required":[]}
+'''

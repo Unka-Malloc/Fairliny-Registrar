@@ -1,0 +1,55 @@
+[package]
+name = "mcp-dispatcher"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Unka-Malloc/MCP-Dispatcher"
+description = "Registration-based MCP service dispatcher: hosts declare tool services once, callers reach them over authenticated MCP on stdio and loopback HTTP."
+keywords = ["mcp", "json-rpc", "dispatcher", "agent", "loopback"]
+categories = ["network-programming", "api-bindings"]
+
+[lib]
+name = "mcp_dispatcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcpd"
+path = "src/bin/mcpd.rs"
+
+# Test/support fixture only: a loopback-free child backend that echoes the
+# framed request it receives. Integration proofs drive `mcpd` against it; it
+# performs no work of its own.
+[[bin]]
+name = "mcpd-stub-backend"
+path = "src/bin/stub_backend.rs"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+anyhow = "1"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The serving process measures its own bytes against the digest the launcher
+# approved, so the payload that comes up is provably the approved one.
+sha2 = "0.10"
+toml = "0.9"
+ureq = "2.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+] }
