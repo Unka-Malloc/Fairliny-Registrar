@@ -196,8 +196,13 @@ def resolve_published(wanted: dict[str, set[str]]):
                 f"version = {json.dumps(requirement)} }}"
             )
         (root / "Cargo.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Cargo discovers .cargo/config.toml by walking up from its cwd —
+        # inside the candidate checkout a committed config (a credential
+        # provider is executable) would load under the release identity.
+        # Run from the scratch root instead, as cargo_metadata does.
         done = subprocess.run(
             ["cargo", "generate-lockfile", "--manifest-path", str(root / "Cargo.toml")],
+            cwd=root,
             capture_output=True,
             text=True,
         )
@@ -824,22 +829,56 @@ def rewrite_manifest(path: pathlib.Path, members: set[str], next_v: str) -> int:
 def set_version(repo: pathlib.Path, next_v: str) -> int:
     """cargo_metadata-driven rewrite, data only: every member manifest and
     the workspace root — where [workspace.dependencies] pins member
-    requirements — so no path dep is left requiring the old numbers."""
+    requirements — so no path dep is left requiring the old numbers.
+    Returns the number of manifests rewritten. The bump is then proven
+    against a fresh metadata read — the rewriter is hand-rolled text
+    surgery, so what it believes it changed is a claim, not evidence."""
     metadata = cargo_metadata(repo)
     member_ids = set(metadata["workspace_members"])
     packages = [p for p in metadata["packages"] if p["id"] in member_ids]
     members = {p["name"] for p in packages}
     files = {pathlib.Path(p["manifest_path"]) for p in packages}
     files.add(pathlib.Path(metadata["workspace_root"]) / "Cargo.toml")
-    return sum(rewrite_manifest(path, members, next_v) for path in sorted(files))
+    rewritten = sum(1 for path in sorted(files)
+                    if rewrite_manifest(path, members, next_v))
+    verify_bump(repo, members, next_v)
+    return rewritten
+
+
+def verify_bump(repo: pathlib.Path, members: set[str], next_v: str) -> None:
+    """The bump is proven by cargo metadata, not by what the rewriter
+    reported: every publishable member must sit at next_v and every
+    dependency requirement naming a member must pin it. A member pin in a
+    form the rewriter cannot see surfaces here as a stopped train, not as
+    a shipped inconsistency inside the publishing job."""
+    metadata = cargo_metadata(repo)
+    member_ids = set(metadata["workspace_members"])
+    wanted = parse_version(next_v)
+    problems: list[str] = []
+    for package in metadata["packages"]:
+        if package["id"] not in member_ids:
+            continue
+        if package["publish"] is None or "crates-io" in package["publish"]:
+            if parse_version(package["version"]) != wanted:
+                problems.append(f"{package['name']} is at {package['version']}")
+        for dep in package["dependencies"]:
+            if dep["name"] in members and dep["req"].removeprefix("^") != next_v:
+                problems.append(
+                    f"{package['name']} requires {dep['name']} {dep['req']}"
+                    f" instead of {next_v}")
+    if problems:
+        raise TrainError(
+            f"set-version could not confirm the bump to {next_v}: "
+            + "; ".join(problems))
 
 
 def cmd_set_version(args: argparse.Namespace) -> int:
     if parse_version(args.version) is None:
         raise TrainError(f"set-version wants <major>.<minor>.<patch>, got {args.version!r}")
-    edited = set_version(pathlib.Path.cwd(), args.version)
+    rewritten = set_version(pathlib.Path.cwd(), args.version)
     report(f"### Version bump\n\nSet every workspace member and member requirement "
-           f"to `{args.version}` ({edited} field(s) rewritten).")
+           f"to `{args.version}` ({rewritten} manifest(s) rewritten; the bump "
+           "is verified against cargo metadata).")
     return 0
 
 
