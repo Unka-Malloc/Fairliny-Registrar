@@ -536,11 +536,14 @@ def cmd_freshness(args: argparse.Namespace) -> int:
 SECTION = re.compile(r"^\[\[?\s*(?P<name>.+?)\s*\]?\]\s*(?:#.*)?$")
 ENTRY = re.compile(
     r"^(?P<key>'[^']+'|\"[^\"]+\"|[A-Za-z0-9_-]+)"
-    r"(?:\.(?P<sub>[A-Za-z0-9_-]+))?\s*=\s*(?P<value>.*)$"
+    r"(?:\.(?P<sub>'[^']+'|\"[^\"]+\"|[A-Za-z0-9_-]+))?\s*=\s*(?P<value>.*)$"
 )
-VERSION_FIELD = re.compile(r'version\s*=\s*"[^"]*"')
+QUOTED = r'"[^"]*"|\'[^\']*\''
+VERSION_FIELD = re.compile(rf"version\s*=\s*(?:{QUOTED})")
+ASSIGN_VALUE = re.compile(rf"(=\s*)(?:{QUOTED})")
 WORKSPACE_FIELD = re.compile(r"\bworkspace\s*=\s*true\b")
-PACKAGE_FIELD = re.compile(r'package\s*=\s*"([^"]+)"')
+PACKAGE_FIELD = re.compile(rf"package\s*=\s*({QUOTED})")
+STRING_VALUE = re.compile(rf"^\s*({QUOTED})")
 
 
 def section_of(line: str) -> str | None:
@@ -554,8 +557,43 @@ def section_of(line: str) -> str | None:
     return found.group("name").rstrip("]").strip()
 
 
-def brace_depth(text: str) -> int:
-    """`{` minus `}` outside quoted strings, for multi-line inline tables."""
+def key_segments(section: str) -> list[str]:
+    """`target.'cfg(unix)'.dependencies` -> `[target, cfg(unix), dependencies]`:
+    dots inside quoted segments stay inside the segment."""
+    parts, current, quote = [], [], ""
+    for ch in section:
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                current.append(ch)
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ".":
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current).strip())
+    return parts
+
+
+def dep_section(segments: list[str]) -> list[str] | None:
+    """The dependency key path when the section opens a dependency table —
+    `[workspace.dependencies]` and `[target.<cfg>.dependencies]` qualify —
+    or a sub-table inside one (`[dependencies.<name>]`); None otherwise."""
+    if segments[:1] == ["workspace"]:
+        segments = segments[1:]
+    elif segments[:1] == ["target"] and len(segments) >= 3:
+        segments = segments[2:]
+    if segments and segments[0] in DEP_KEYS:
+        return segments[1:]
+    return None
+
+
+def open_depth(text: str) -> int:
+    """`{`/`[` minus `}`/`]` outside quoted strings — a multi-line inline
+    table or array keeps the entry it started on open until it closes."""
     depth, quote, escaped = 0, "", False
     for ch in text:
         if quote:
@@ -567,63 +605,217 @@ def brace_depth(text: str) -> int:
                 quote = ""
         elif ch in "\"'":
             quote = ch
-        elif ch == "{":
+        elif ch in "{[":
             depth += 1
-        elif ch == "}":
+        elif ch in "}]":
             depth -= 1
     return depth
+
+
+def gather(rest: list[str], index: int) -> tuple[str, int]:
+    """The entry text starting at rest[index], continued while its inline
+    table or array stays open; returns (text, index of its last line)."""
+    block = [rest[index]]
+    while open_depth("".join(block)) > 0 and index + 1 < len(rest):
+        index += 1
+        block.append(rest[index])
+    return "".join(block), index
+
+
+def string_value(text: str) -> str | None:
+    """The bare-string scalar a value starts with, unquoted, or None."""
+    found = STRING_VALUE.match(text or "")
+    return found.group(1)[1:-1] if found else None
+
+
+def unrecognized(path: pathlib.Path, section: str, line: str) -> TrainError:
+    return TrainError(
+        f"{path}: [{section}] entry {line.strip()!r} is not a dependency shape "
+        "set-version recognizes")
+
+
+def rewrite_package(path: pathlib.Path, section: str, body: list[str],
+                    next_v: str) -> tuple[list[str], int]:
+    """`[package]`/`[workspace.package]`: the member's own version field."""
+    out, edited = [], 0
+    for line in body:
+        if re.match(r"version\s*=", line.strip()):
+            new = VERSION_FIELD.sub(f'version = "{next_v}"', line, count=1)
+            if new == line:
+                raise TrainError(
+                    f"{path}: [{section}] version is not a plain string")
+            line, edited = new, edited + 1
+        out.append(line)
+    return out, edited
+
+
+def rewrite_dep_table(path: pathlib.Path, section: str, body: list[str],
+                      members: set[str], next_v: str) -> tuple[list[str], int]:
+    """A flat dependency table: bare strings, inline tables (multi-line
+    included) and dotted keys. A member requirement in a form this cannot
+    rewrite fails instead of silently keeping the old pin."""
+    header, rest = body[0], body[1:]
+    # Dotted-key renames (`foo.package = "real"`) may sit below the entries
+    # they qualify — collect them before rewriting.
+    renames: dict[str, str] = {}
+    index = 0
+    while index < len(rest):
+        found = ENTRY.match(rest[index].strip())
+        if found and (found.group("sub") or "").strip("'\"") == "package":
+            value = string_value(found.group("value"))
+            if value:
+                renames[found.group("key").strip("'\"")] = value
+        _, index = gather(rest, index)
+        index += 1
+    out, edited, index = [header], 0, 0
+    while index < len(rest):
+        stripped = rest[index].strip()
+        text, index = gather(rest, index)
+        index += 1
+        if not stripped or stripped.startswith("#"):
+            out.append(text)
+            continue
+        found = ENTRY.match(stripped)
+        if found is None:
+            raise unrecognized(path, section, text)
+        key = found.group("key").strip("'\"")
+        sub = (found.group("sub") or "").strip("'\"")
+        if sub:
+            if sub == "version" and renames.get(key, key) in members:
+                text, count = ASSIGN_VALUE.subn(f'\\g<1>"{next_v}"', text, count=1)
+                if not count:
+                    raise TrainError(
+                        f"{path}: [{section}] `{key}.version` is not a plain string")
+                edited += 1
+            out.append(text)
+            continue
+        if WORKSPACE_FIELD.search(text):
+            out.append(text)
+            continue
+        package = PACKAGE_FIELD.search(text)
+        if (package.group(1)[1:-1] if package else key) not in members:
+            out.append(text)
+            continue
+        if VERSION_FIELD.search(text):
+            text = VERSION_FIELD.sub(f'version = "{next_v}"', text, count=1)
+        elif found.group("value").lstrip().startswith(("\"", "'")):
+            text = ASSIGN_VALUE.sub(f'\\g<1>"{next_v}"', text, count=1)
+        elif "{" in text:
+            opening = re.search(r"\{(\s*)", text)
+            assert opening is not None
+            gap = opening.group(1)
+            closing = text[opening.end(1):].lstrip().startswith("}")
+            comma = "" if closing else ","
+            insert = (f'version = "{next_v}"{comma}' + gap
+                      if "\n" in gap else f'version = "{next_v}"{comma} ')
+            text = text[:opening.end(1)] + insert + text[opening.end(1):]
+        else:
+            raise TrainError(
+                f"{path}: [{section}] member dependency `{key}` is in a form "
+                "set-version cannot rewrite")
+        edited += 1
+        out.append(text)
+    return out, edited
+
+
+def rewrite_dep_subtable(path: pathlib.Path, section: str, dep_key: str,
+                         body: list[str], members: set[str],
+                         next_v: str) -> tuple[list[str], int]:
+    """`[dependencies.<dep_key>]` (and the namespaced variants): the member
+    pin lives on `version =` lines inside the table, and `package =` may
+    rename the dependency. A path-only member table gains an explicit pin,
+    matching what the flat `{ path = ... }` form gets."""
+    header, rest = body[0], body[1:]
+    package = None
+    for line in rest:
+        found = ENTRY.match(line.strip())
+        if found and found.group("key").strip("'\"") == "package" \
+                and not found.group("sub"):
+            package = string_value(found.group("value"))
+    if (package or dep_key) not in members:
+        return body, 0
+    out, edited, inherited, index = [header], 0, False, 0
+    while index < len(rest):
+        stripped = rest[index].strip()
+        text, index = gather(rest, index)
+        index += 1
+        if not stripped or stripped.startswith("#"):
+            out.append(text)
+            continue
+        found = ENTRY.match(stripped)
+        if found is None:
+            raise unrecognized(path, section, text)
+        key = found.group("key").strip("'\"")
+        sub = (found.group("sub") or "").strip("'\"")
+        if key == "version" and not sub:
+            text, count = ASSIGN_VALUE.subn(f'\\g<1>"{next_v}"', text, count=1)
+            if not count:
+                raise TrainError(
+                    f"{path}: [{section}] member `{dep_key}` pins a version "
+                    "set-version cannot rewrite")
+            edited += 1
+        elif key == "version" and sub == "workspace" \
+                or key == "workspace" and WORKSPACE_FIELD.search(text):
+            inherited = True
+        out.append(text)
+    if not edited and not inherited:
+        out.insert(1, f'version = "{next_v}"\n')
+        edited += 1
+    return out, edited
+
+
+def rewrite_section(path: pathlib.Path, section: str | None, body: list[str],
+                    members: set[str], next_v: str) -> tuple[list[str], int]:
+    if section is None:
+        return body, 0
+    segments = key_segments(section)
+    if segments in (["package"], ["workspace", "package"]):
+        return rewrite_package(path, section, body, next_v)
+    subs = dep_section(segments)
+    if subs is None:
+        return body, 0
+    if not subs:
+        return rewrite_dep_table(path, section, body, members, next_v)
+    if len(subs) > 1:
+        if subs[0] in members:
+            raise TrainError(
+                f"{path}: [{section}] nests under member dependency `{subs[0]}` "
+                "in a form set-version cannot rewrite")
+        return body, 0
+    return rewrite_dep_subtable(path, section, subs[0], body, members, next_v)
 
 
 def rewrite_manifest(path: pathlib.Path, members: set[str], next_v: str) -> int:
     """Move a manifest to `next_v`: `[package]`/`[workspace.package]` version
     and every dependency-table entry whose package names a workspace member
-    — the coordinated bump keeps manifests internally consistent, so the
-    lockfile update afterwards resolves against the new member versions."""
+    — bare strings, inline tables, dotted keys and `[<table>.<member>]`
+    sub-tables, under `[dev-]`/`[build-]`/`[workspace.]`/`[target.<cfg>.]`
+    variants alike — so the coordinated bump keeps manifests internally
+    consistent and the lockfile update afterwards resolves against the new
+    member versions. A member requirement in a shape the rewriter cannot
+    update stops the train instead of leaving a stale pin that would first
+    surface inside the publishing job."""
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    out, section, edited, index = [], "", 0, 0
-    while index < len(lines):
-        line = lines[index]
+    # Segment the document into (section, body) pairs: a dependency
+    # sub-table's `package =` rename can sit lines away from its pin, so
+    # rewriting needs the whole section in view.
+    segments: list[tuple[str | None, list[str]]] = []
+    name: str | None = None
+    body: list[str] = []
+    for line in lines:
         found = section_of(line)
         if found is not None:
-            section = found
+            segments.append((name, body))
+            name, body = found, [line]
         else:
-            last = section.rsplit(".", 1)[-1].strip().strip("'\"")
-            stripped = line.strip()
-            if last == "package" and re.match(r'^version\s*=\s*"', stripped):
-                line = VERSION_FIELD.sub(f'version = "{next_v}"', line, count=1)
-                edited += 1
-            elif last in DEP_KEYS:
-                entry = ENTRY.match(stripped)
-                if entry and entry.group("sub") == "version" \
-                        and entry.group("key").strip("'\"") in members:
-                    line = re.sub(r'=\s*"[^"]*"', f'= "{next_v}"', line, count=1)
-                    edited += 1
-                elif entry and entry.group("sub") is None:
-                    block = [line]
-                    while brace_depth("".join(block)) > 0 and index + 1 < len(lines):
-                        index += 1
-                        block.append(lines[index])
-                    text = "".join(block)
-                    value = entry.group("value")
-                    package = PACKAGE_FIELD.search(text)
-                    if not WORKSPACE_FIELD.search(text) \
-                            and (package.group(1) if package else entry.group("key").strip("'\"")) in members:
-                        if VERSION_FIELD.search(text):
-                            text = VERSION_FIELD.sub(f'version = "{next_v}"', text, count=1)
-                        elif value.lstrip().startswith('"'):
-                            text = re.sub(r'=\s*"[^"]*"', f'= "{next_v}"', text, count=1)
-                        elif "{" in text:
-                            opening = re.search(r"\{(\s*)", text)
-                            gap = opening.group(1)
-                            closing = text[opening.end(1):].lstrip().startswith("}")
-                            comma = "" if closing else ","
-                            insert = (f'version = "{next_v}"{comma}' + gap
-                                      if "\n" in gap else f'version = "{next_v}"{comma} ')
-                            text = text[:opening.end(1)] + insert + text[opening.end(1):]
-                        edited += 1
-                    line = text
-        out.append(line)
-        index += 1
+            body.append(line)
+    segments.append((name, body))
+    out: list[str] = []
+    edited = 0
+    for name, body in segments:
+        rewritten, count = rewrite_section(path, name, body, members, next_v)
+        out.extend(rewritten)
+        edited += count
     if edited:
         path.write_text("".join(out), encoding="utf-8")
     return edited

@@ -156,33 +156,45 @@ jobs:
         if: steps.version.outputs.release == 'true'
         run: |
           scripts/verify.sh
-      # Live runs only — a rehearsal does not pay for a release-shaped
-      # build. The OIDC job recreates the bump from the bound commit with
-      # the same helper, so nothing a verify-runner produced crosses the
-      # OIDC boundary.
+      # Every mode runs the release-shaped bump: the manifest rewriter is
+      # hand-written, and a rehearsal that skipped it would let a defect
+      # surface for the first time inside the OIDC job — after the approval
+      # gate. That job still recreates the bump from the bound commit with
+      # its own staged helper, so nothing a verify-runner produced crosses
+      # the boundary either way.
       - name: Apply the release version
         if: >-
           steps.version.outputs.release == 'true' &&
-          steps.version.outputs.needs_set == 'true' &&
-          env.RELEASE_MODE == 'live'
+          steps.version.outputs.needs_set == 'true'
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
           python3 "$RUNNER_TEMP/release.py" set-version "$NEXT"
           cargo update --workspace
 
-      # Live runs only. No artifacts ship to the OIDC job: it repackages
-      # the bound commit itself with `cargo package --no-verify`, which
-      # collects manifest-declared files without compiling or running
-      # build scripts.
+      # Rehearsals build the .crate set with --no-verify — manifest
+      # normalization and member-pin resolution run for real, only the
+      # compile and the upload dry-run stay unexercised — then restore the
+      # tree the bump rewrote. Live runs pay for `cargo publish --dry-run`.
+      # No artifacts ship to the OIDC job either way: it repackages the
+      # bound commit itself with `cargo package --no-verify`, collecting
+      # manifest-declared files without compiling or running build scripts.
       - name: Package
-        if: steps.version.outputs.release == 'true' && env.RELEASE_MODE == 'live'
+        if: steps.version.outputs.release == 'true'
         env:
           EXCLUDES: ${{ steps.version.outputs.excludes }}
         run: |
           args=()
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
-          cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
+          if [ "$RELEASE_MODE" = "live" ]; then
+            cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
+          else
+            cargo package --workspace --allow-dirty --no-verify "${args[@]}"
+            # Restore what the rehearsal rewrote: tracked manifests and the
+            # lockfile, plus a Cargo.lock created where none was tracked.
+            git checkout -- .
+            git clean -fq -- Cargo.lock
+          fi
 
       # The release train (default branch) reads this data-only file for the
       # candidate pointer and a skip pre-filter — the only fields the gate
