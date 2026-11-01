@@ -1,0 +1,16 @@
+# Generated release train for Unka-Malloc/MCP-Dispatcher.
+# Regenerate instead of editing: records which engine revision and
+# which source inputs produced the generated files beside it.
+[generator]
+engine = "release-engine"
+version = "0.1.0"
+
+[source]
+templates = "sha256:333a0a4397c288d3213dd7692ccd69d0eb75df064d9d5e792593897ca1f0d771"
+declaration = "sha256:27d93c5298b91bb1e1fc9f4951f3546b90a8f8787202c6b4ca91f22b3b783883"
+
+[outputs]
+".github/workflows/verify.yml" = "sha256:9552793a2ce93a4bb6d191d4f7046ac76d165328ffde489f8d52ed668b7815a2"
+".github/workflows/publish.yml" = "sha256:ba9b7b5c9872920986b58a6434280cea95a1ee1ab598b446d7d2dd89833eefd1"
+".github/workflows/ci.yml" = "sha256:96f3c5eb3d4d9310e5f9e869dca342ab79833b2cef6b793175a48f7945e2eec2"
+".github/release.py" = "sha256:fa4dd3d43d38eb201fe91a3912a42e71fe5e9bf348b249ac8230e88315f59cf7"
