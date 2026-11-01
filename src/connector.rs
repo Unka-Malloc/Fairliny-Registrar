@@ -6,12 +6,15 @@
 //! context mapping and the no-replay tool list arrive inside the published
 //! discovery document — the connector learns them, it does not carry them.
 
-use crate::application::{MAX_MCP_FRAME_BYTES, PROTOCOL_REVISION, supports_protocol_revision};
+use crate::application::{COMPATIBLE_PROTOCOL_REVISIONS, MAX_MCP_FRAME_BYTES, PROTOCOL_REVISION};
 use crate::transport::{
     ConnectorDiscoveryError, connector_close_session, connector_exchange, load_connector_discovery,
     published_callers,
 };
-use crate::{McpMessage, McpStdioFrame, encode_http_body, encode_stdio_line, read_stdio_frame};
+use crate::{
+    McpMessage, McpServerDefinition, McpStdioFrame, encode_http_body, encode_stdio_line,
+    read_stdio_frame,
+};
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -29,6 +32,20 @@ const DIAGNOSTIC_PREFIX: &str = "mcpd";
 /// The environment variable a caller may declare its provider id through,
 /// instead of `--caller`.
 const CALLER_ENV: &str = "MCPD_CALLER";
+
+/// The wire contract this connector speaks: the crate's fixed revision set
+/// and frame bound as one `McpServerDefinition`, so the client checks the
+/// same predicate the serving side enforces — the two can never drift on
+/// what a peer may ask for or how large a frame may be.
+fn connector_definition() -> McpServerDefinition {
+    McpServerDefinition {
+        protocol_revision: PROTOCOL_REVISION,
+        compatible_protocol_revisions: COMPATIBLE_PROTOCOL_REVISIONS,
+        server_name: "mcpd-connector",
+        server_version: env!("CARGO_PKG_VERSION"),
+        max_message_bytes: MAX_MCP_FRAME_BYTES,
+    }
+}
 
 /// Why this process refused to start. Each cause names itself so the client
 /// can act without inspecting anything else.
@@ -113,6 +130,7 @@ fn run(args: &[String]) -> Result<(), ()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let writer = Arc::new(Mutex::new(io::stdout()));
+    let definition = connector_definition();
     let mut session_id: Option<String> = None;
     let mut initialization: Option<McpMessage> = None;
     let mut protocol_revision = PROTOCOL_REVISION.to_owned();
@@ -161,8 +179,9 @@ fn run(args: &[String]) -> Result<(), ()> {
                 && initialize_protocol_revision(&message).is_none()
                 && let Some(initialize) = initialization.as_ref()
             {
-                let body = encode_http_body(initialize, MAX_MCP_FRAME_BYTES).map_err(|_| ())?;
-                match connector_exchange(&discovery, None, &protocol_revision, &body) {
+                let body =
+                    encode_http_body(initialize, definition.max_message_bytes).map_err(|_| ())?;
+                match connector_exchange(&discovery, None, &protocol_revision, &body, &definition) {
                     Ok((200, Some(id), _)) => {
                         session_id = Some(id);
                     }
@@ -177,7 +196,7 @@ fn run(args: &[String]) -> Result<(), ()> {
             }
             if session_id.is_none()
                 && let Some(requested) = initialize_protocol_revision(&message)
-                && supports_protocol_revision(requested)
+                && definition.supports_protocol_revision(requested)
             {
                 protocol_revision = requested.to_owned();
             }
@@ -186,6 +205,7 @@ fn run(args: &[String]) -> Result<(), ()> {
                     return Err(());
                 }
                 let discovery = discovery.clone();
+                let definition = definition.clone();
                 let protocol_revision = protocol_revision.clone();
                 let writer = Arc::clone(&writer);
                 workers.push(thread::spawn(move || {
@@ -194,6 +214,7 @@ fn run(args: &[String]) -> Result<(), ()> {
                         Some(&session_id),
                         None,
                         &protocol_revision,
+                        &definition,
                         message,
                         &writer,
                     )
@@ -205,6 +226,7 @@ fn run(args: &[String]) -> Result<(), ()> {
                     None,
                     Some(&mut session_id),
                     &protocol_revision,
+                    &definition,
                     message,
                     &writer,
                 )?;
@@ -237,12 +259,13 @@ fn forward(
     session_id: Option<&str>,
     allocated_session: Option<&mut Option<String>>,
     protocol_revision: &str,
+    definition: &McpServerDefinition,
     message: McpMessage,
     writer: &Mutex<io::Stdout>,
 ) -> Result<Option<String>, ()> {
-    let body = encode_http_body(&message, MAX_MCP_FRAME_BYTES).map_err(|_| ())?;
+    let body = encode_http_body(&message, definition.max_message_bytes).map_err(|_| ())?;
     let (status, returned_session, response) =
-        match connector_exchange(discovery, session_id, protocol_revision, &body) {
+        match connector_exchange(discovery, session_id, protocol_revision, &body, definition) {
             Ok(response) => response,
             Err(_) => {
                 module_unavailable(&message, writer, discovery, true)?;
@@ -260,7 +283,7 @@ fn forward(
     }
     match status {
         200 => {
-            let response = match crate::decode_http_body(&response, MAX_MCP_FRAME_BYTES) {
+            let response = match crate::decode_http_body(&response, definition.max_message_bytes) {
                 Ok(response) => response,
                 Err(_) => {
                     module_unavailable(&message, writer, discovery, true)?;

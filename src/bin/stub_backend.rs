@@ -12,6 +12,9 @@
 //!   proof can hold an ordinary call open;
 //! * request `"name": "fixture_cancel"` — writes `released`, ending the
 //!   hold, so a proof can show the control channel bypasses held work;
+//! * request `"name": "fixture_drop"` — the child exits immediately without
+//!   replying, so the parent sees EOF mid-call (a post-write transport
+//!   failure whose outcome is unknown);
 //! * every reply echoes `marker` = `$MCPD_STUB_MARKER`, proving the child
 //!   inherited the real environment rather than an empty one.
 
@@ -66,6 +69,10 @@ fn execute(request: &Value) -> Value {
                     let _ = fs::write(root.join("released"), "yes");
                 }
             }
+            // The request was read and the child dies before answering:
+            // exactly the post-write failure an effect call must never
+            // replay after.
+            "fixture_drop" => std::process::exit(0),
             _ => {}
         }
     }

@@ -11,10 +11,13 @@
 
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    time::Duration,
 };
 
 const MCPD: &str = env!("CARGO_BIN_EXE_mcpd");
@@ -527,5 +530,199 @@ fn an_unadmitted_caller_is_refused_before_any_frame() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not an admitted caller"), "{stderr}");
     assert!(stderr.contains("other-caller"), "{stderr}");
+    assert_eq!(fixture.lifecycle("stop")["state"], "stopped");
+}
+
+#[test]
+fn an_effect_call_lost_after_the_backend_read_reports_outcome_unknown() {
+    // The stub backend reads the framed request and exits without replying:
+    // the request line left the dispatcher, so the effect call's outcome is
+    // unknown and must be reported without any retry invitation.
+    let fixture = Fixture::with_config(Some(format!(
+        r#"[server]
+name = "dropping"
+version = "0.1.0"
+
+{alpha}
+"#,
+        alpha = service_block(
+            "alpha",
+            r#""fixture""#,
+            "",
+            &[tool("fixture_drop", true), tool("fixture_echo", false)].concat(),
+        ),
+    )));
+    assert_eq!(fixture.lifecycle("start")["state"], "running");
+    let mut connector = fixture.connector("fixture");
+    let mut input = connector.stdin.take().unwrap();
+    let mut output = BufReader::new(connector.stdout.take().unwrap());
+    initialize(&mut input, &mut output);
+
+    let lost = exchange(
+        &mut input,
+        &mut output,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fixture_drop","arguments":{"text":"x"}}}),
+    );
+    // A successful JSON-RPC reply carrying the structured outcome-unknown
+    // tool error: the backend read the request line, then died.
+    assert_eq!(lost["result"]["isError"], true);
+    let payload = &lost["result"]["structuredContent"];
+    assert_eq!(payload["reasonCode"], "mcp_outcome_unknown");
+    assert_eq!(payload["requestMayHaveExecuted"], true);
+    assert_eq!(payload["retryable"], false);
+    assert_eq!(payload["recovery"], "reconcile_before_retry");
+
+    // The service stays healthy: the desynced session was dropped and the
+    // next call spawns a fresh child session.
+    let again = exchange(
+        &mut input,
+        &mut output,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fixture_echo","arguments":{"text":"still-here"}}}),
+    );
+    assert_eq!(
+        again["result"]["structuredContent"]["request"]["arguments"]["text"],
+        "still-here"
+    );
+    drop(input);
+    assert!(connector.wait().unwrap().success());
+    assert_eq!(fixture.lifecycle("stop")["state"], "stopped");
+}
+
+/// One raw HTTP request against the published endpoint — the loopback
+/// boundary answers and closes (`connection: close`).
+fn raw_post(
+    address: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, BTreeMap<String, String>) {
+    let mut request = String::from("POST /mcp HTTP/1.1\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!("content-length: {}\r\n\r\n{body}", body.len()));
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8(raw).unwrap();
+    let (head, _) = text.split_once("\r\n\r\n").unwrap();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+    (status, headers)
+}
+
+#[test]
+fn the_loopback_boundary_enforces_its_admission_contract() {
+    // The published endpoint's admission contract, exercised with raw HTTP:
+    // every check the boundary promises runs before session or tool state.
+    let fixture = Fixture::new();
+    assert_eq!(fixture.lifecycle("start")["state"], "running");
+    let document: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.home.join("discovery.json")).unwrap())
+            .unwrap();
+    let endpoint = document["endpoint"].as_str().unwrap();
+    let address = endpoint
+        .strip_prefix("http://")
+        .and_then(|rest| rest.strip_suffix("/mcp"))
+        .expect("a numeric loopback endpoint");
+    let token = document["tokens"]["fixture"].as_str().unwrap();
+    let other_token = document["tokens"]["other-caller"].as_str().unwrap();
+    let bearer = |token: &str| format!("Bearer {token}");
+    let initialize_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"raw\",\"version\":\"1\"}}}";
+    let list_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}";
+    let json = ("content-type", "application/json");
+    let revision = ("mcp-protocol-version", "2025-06-18");
+    let bearer_header = bearer(token);
+    let auth = ("authorization", bearer_header.as_str());
+
+    // Exact Host: absent, or anything but the numeric loopback address.
+    let (status, _) = raw_post(address, &[auth, json, revision], initialize_body);
+    assert_eq!(status, 400, "a missing Host must be refused");
+    for wrong in ["localhost", "127.0.0.1", "example.com"] {
+        let host = ("host", wrong);
+        let (status, _) = raw_post(address, &[host, auth, json, revision], initialize_body);
+        assert_eq!(status, 400, "Host '{wrong}' must be refused");
+    }
+    let host = ("host", address);
+
+    // Any Origin header is a browser request — refused even with a bearer.
+    let (status, _) = raw_post(
+        address,
+        &[
+            host,
+            ("origin", "http://attacker.example"),
+            auth,
+            json,
+            revision,
+        ],
+        initialize_body,
+    );
+    assert_eq!(status, 400, "an Origin must be refused");
+
+    // Bearer identity: absent and wrong both fail before any route logic.
+    let (status, _) = raw_post(address, &[host, json, revision], initialize_body);
+    assert_eq!(status, 401, "a missing bearer must be refused");
+    let (status, _) = raw_post(
+        address,
+        &[host, ("authorization", "Bearer deadbeef"), json, revision],
+        initialize_body,
+    );
+    assert_eq!(status, 401, "a wrong bearer must be refused");
+
+    // An unsupported mcp-protocol-version is refused before session logic.
+    let (status, _) = raw_post(
+        address,
+        &[host, auth, json, ("mcp-protocol-version", "1999-01-01")],
+        initialize_body,
+    );
+    assert_eq!(status, 400, "an unsupported revision must be refused");
+
+    // The well-formed handshake is admitted and mints a session.
+    let (status, headers) = raw_post(address, &[host, auth, json, revision], initialize_body);
+    assert_eq!(status, 200, "the handshake must succeed");
+    let session = headers["mcp-session-id"].as_str();
+
+    // A session id is caller-bound: another admitted caller holding it is
+    // still a 404, and an invented id is equally foreign.
+    let other_bearer = bearer(other_token);
+    let other_auth = ("authorization", other_bearer.as_str());
+    let session_header = ("mcp-session-id", session);
+    let (status, _) = raw_post(
+        address,
+        &[host, other_auth, json, revision, session_header],
+        list_body,
+    );
+    assert_eq!(status, 404, "a foreign session id must be refused");
+    let (status, _) = raw_post(
+        address,
+        &[
+            host,
+            auth,
+            json,
+            revision,
+            ("mcp-session-id", "f".repeat(32).as_str()),
+        ],
+        list_body,
+    );
+    assert_eq!(status, 404, "an unknown session id must be refused");
+
+    // A well-formed POST on the admitted session is served.
+    let (status, _) = raw_post(
+        address,
+        &[host, auth, json, revision, session_header],
+        list_body,
+    );
+    assert_eq!(status, 200, "a session-bound call must succeed");
     assert_eq!(fixture.lifecycle("stop")["state"], "stopped");
 }

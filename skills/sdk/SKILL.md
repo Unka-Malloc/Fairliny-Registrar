@@ -44,8 +44,10 @@ build an `McpServerEngine` over a `McpServerDefinition`, and serve.
   — your handler in-process. `request` carries `tool`, `arguments`,
   `caller` (`provider_id` + declared `attributes`; `authenticated` is the
   transport's verdict, never forwarded to a backend scope), `channel`
-  (`General`/`Control`) and `cancelled` (cooperative flag set by
-  `notifications/cancelled`).
+  (`General`/`Control`), `effect` (the owning spec's effect flag — a
+  post-write backend failure on an effect call must surface
+  `mcp_outcome_unknown`, never a retryable error) and `cancelled`
+  (cooperative flag set by `notifications/cancelled`).
 - `NativeBackend::new(NativeSpec::new(program, args, protocol, invoke)?)`
   — a pooled child process speaking newline-framed JSON. `invoke` is the
   argv template; the literal `{request}` element is replaced by the JSON

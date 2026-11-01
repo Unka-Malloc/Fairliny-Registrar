@@ -5,7 +5,6 @@
 //! tokens live only in the owner-only discovery document; sessions, tool
 //! workers and control calls are all bounded.
 
-use crate::application::{MAX_MCP_FRAME_BYTES, PROTOCOL_REVISION, supports_protocol_revision};
 use crate::private_state;
 use crate::registry::{CallerContext, ContextField, valid_caller_id, valid_tool_name};
 use crate::{
@@ -23,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DISCOVERY_SCHEMA: &str = "mcpd.discovery.v1";
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
@@ -32,6 +31,9 @@ const MAX_SESSIONS: usize = 64;
 const MAX_TOOL_WORKERS: usize = 8;
 const MAX_CONTEXT_FIELDS: usize = 16;
 const MAX_PUBLISHED_TOOLS: usize = 256;
+/// A session no request has touched within this TTL is reaped on the next
+/// table access: a crashed connector cannot hold its slot forever.
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -205,13 +207,16 @@ impl HttpService {
     /// Health is the real contract, not thread liveness: one authenticated
     /// initialize plus the exact ordered union catalog. The probe identity
     /// never leaves the process and the probe session is closed afterwards.
+    /// The probe speaks the served definition's own revision and frame
+    /// bound, so a host-built definition is probed on its own terms.
     pub fn health_probe(&self) -> bool {
+        let definition = &self.probe_definition;
         let initialize = McpMessage::request(
             McpRequestId::from(1_i64),
             "initialize",
             Some(
                 serde_json::json!({
-                    "protocolVersion": PROTOCOL_REVISION,
+                    "protocolVersion": definition.protocol_revision,
                     "capabilities": {},
                     "clientInfo": {"name": "mcpd-supervisor-health", "version": "1"}
                 })
@@ -223,10 +228,11 @@ impl HttpService {
         let Ok(initialize) = initialize else {
             return false;
         };
-        let Ok(body) = encode_http_body(&initialize, MAX_MCP_FRAME_BYTES) else {
+        let Ok(body) = encode_http_body(&initialize, definition.max_message_bytes) else {
             return false;
         };
-        let Ok((status, session, response)) = health_exchange(&self.probe_identity, None, &body)
+        let Ok((status, session, response)) =
+            health_exchange(&self.probe_identity, None, &body, definition)
         else {
             return false;
         };
@@ -241,10 +247,9 @@ impl HttpService {
             return false;
         };
         let healthy = (|| {
-            let negotiated = decode_http_body(&response, MAX_MCP_FRAME_BYTES)
+            let negotiated = decode_http_body(&response, definition.max_message_bytes)
                 .ok()
                 .map(|message| message.to_value());
-            let definition = &self.probe_definition;
             let valid_initialize = negotiated.as_ref().is_some_and(|value| {
                 value
                     .pointer("/result/protocolVersion")
@@ -265,14 +270,14 @@ impl HttpService {
             let Ok(list) = McpMessage::request(2_i64, "tools/list", Some(Map::new())) else {
                 return false;
             };
-            let Ok(body) = encode_http_body(&list, MAX_MCP_FRAME_BYTES) else {
+            let Ok(body) = encode_http_body(&list, definition.max_message_bytes) else {
                 return false;
             };
-            let listed = health_exchange(&self.probe_identity, Some(&session), &body)
+            let listed = health_exchange(&self.probe_identity, Some(&session), &body, definition)
                 .ok()
                 .and_then(|(status, returned, response)| {
                     (status == 200 && returned.as_deref() == Some(session.as_str()))
-                        .then(|| decode_http_body(&response, MAX_MCP_FRAME_BYTES).ok())
+                        .then(|| decode_http_body(&response, definition.max_message_bytes).ok())
                         .flatten()
                 })
                 .map(|message| message.to_value());
@@ -334,6 +339,17 @@ struct ServerSession {
     provider: String,
     state: Arc<McpSessionState>,
     caller: Mutex<SessionCallerBinding>,
+    /// The last time a request touched this session — the idle clock the
+    /// table reaper reads.
+    last_seen: Instant,
+}
+
+/// Reap sessions idle past `SESSION_IDLE_TTL`. Runs under the table lock on
+/// every acquisition — the table is bounded (`MAX_SESSIONS`), so the sweep
+/// is cheap and needs no separate reaper thread.
+fn reap_idle_sessions(sessions: &mut HashMap<String, ServerSession>) {
+    let now = Instant::now();
+    sessions.retain(|_, session| now.duration_since(session.last_seen) < SESSION_IDLE_TTL);
 }
 
 fn merge_session_caller_binding(
@@ -405,7 +421,10 @@ struct HttpRequest {
 fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    let request = match read_http_request(&mut stream) {
+    // The served definition is the single frame-bound source: what the
+    // transport admits is exactly what the engine negotiated to serve.
+    let max_frame_bytes = service.engine.definition().max_message_bytes;
+    let request = match read_http_request(&mut stream, max_frame_bytes) {
         Ok(request) => request,
         Err(_) => return write_http(&mut stream, 400, &[], b""),
     };
@@ -462,6 +481,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
             .sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        reap_idle_sessions(&mut sessions);
         let removed = sessions
             .get(session_id)
             .is_some_and(|session| session.provider == *provider)
@@ -474,7 +494,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
     if request.headers.get("content-type").map(String::as_str) != Some("application/json") {
         return write_http(&mut stream, 415, &[], b"");
     }
-    let message = match decode_http_body(&request.body, MAX_MCP_FRAME_BYTES) {
+    let message = match decode_http_body(&request.body, max_frame_bytes) {
         Ok(message) => message,
         Err(_) => return write_http(&mut stream, 400, &[], b""),
     };
@@ -498,11 +518,13 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
         None => return write_http(&mut stream, 400, &[], b""),
     }
     let requested_session = request.headers.get("mcp-session-id").cloned();
-    let (session_id, session, binding) = if initialize && requested_session.is_none() {
+    let fresh_session = initialize && requested_session.is_none();
+    let (session_id, session, binding) = if fresh_session {
         let mut sessions = service
             .sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        reap_idle_sessions(&mut sessions);
         if sessions.len() >= MAX_SESSIONS {
             return write_http(&mut stream, 503, &[], b"");
         }
@@ -519,6 +541,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
                 provider: provider.clone(),
                 state: Arc::clone(&session),
                 caller: Mutex::new(binding.clone()),
+                last_seen: Instant::now(),
             },
         );
         (id, session, binding)
@@ -526,16 +549,18 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
         let Some(id) = requested_session else {
             return write_http(&mut stream, 400, &[], b"");
         };
-        let sessions = service
+        let mut sessions = service
             .sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        reap_idle_sessions(&mut sessions);
         let Some(stored) = sessions
-            .get(&id)
+            .get_mut(&id)
             .filter(|session| session.provider == *provider)
         else {
             return write_http(&mut stream, 404, &[], b"");
         };
+        stored.last_seen = Instant::now();
         let session = Arc::clone(&stored.state);
         let binding = {
             let mut guard = stored
@@ -583,20 +608,42 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
     };
     match service.engine.handle(&session, &caller, message) {
         Some(response) => {
-            let body = encode_http_body(&response, MAX_MCP_FRAME_BYTES)?;
+            let body = encode_http_body(&response, max_frame_bytes)?;
+            // A session minted for this handshake lives only while
+            // initialize succeeded: a refused handshake frees its slot at
+            // once, so retrying bad handshakes can never exhaust the table
+            // and a crashed connector cannot leak a usable id.
+            let mut session_live = true;
+            if fresh_session && !session.initialized() {
+                service
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&session_id);
+                session_live = false;
+            }
             let response_protocol_revision = session
                 .protocol_revision()
                 .unwrap_or(service.engine.definition().protocol_revision);
-            write_http(
-                &mut stream,
-                200,
-                &[
-                    ("content-type", "application/json"),
-                    ("mcp-session-id", session_id.as_str()),
-                    ("mcp-protocol-version", response_protocol_revision),
-                ],
-                &body,
-            )
+            if session_live {
+                write_http(
+                    &mut stream,
+                    200,
+                    &[
+                        ("content-type", "application/json"),
+                        ("mcp-session-id", session_id.as_str()),
+                        ("mcp-protocol-version", response_protocol_revision),
+                    ],
+                    &body,
+                )
+            } else {
+                write_http(
+                    &mut stream,
+                    200,
+                    &[("content-type", "application/json")],
+                    &body,
+                )
+            }
         }
         None => write_http(
             &mut stream,
@@ -626,7 +673,7 @@ impl Drop for ToolPermit<'_> {
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+fn read_http_request(stream: &mut TcpStream, max_body_bytes: usize) -> Result<HttpRequest> {
     let mut bytes = Vec::with_capacity(1024);
     let header_end = loop {
         if bytes.len() >= MAX_HTTP_HEADER_BYTES {
@@ -675,7 +722,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(0);
-    if content_length > MAX_MCP_FRAME_BYTES {
+    if content_length > max_body_bytes {
         return Err(anyhow!("http_body_too_large"));
     }
     let mut body = bytes[header_end..].to_vec();
@@ -899,20 +946,47 @@ pub fn load_connector_discovery(
     })
 }
 
-pub fn connector_exchange(
+/// The caller-side deadlines one exchange admits: the connector lets a
+/// live call run as long as the service answers, while the health probe
+/// stays tightly bounded so the monitor responds quickly.
+struct ExchangeDeadline {
+    connect: Duration,
+    read: Option<Duration>,
+    write: Option<Duration>,
+}
+
+/// Why an exchange failed before the caller could see a status line —
+/// call sites keep only their own error naming.
+enum ExchangeFailure {
+    Transport,
+    ResponseTooLarge,
+}
+
+/// The one client-side wire contract, shared by the connector and the
+/// service's own health probe so the two can never drift: one POST to the
+/// endpoint with the bearer identity, the negotiated revision header, an
+/// optional session id, the declared context headers when the caller asks
+/// for them, and a reply read bounded by the definition's own frame bound.
+fn exchange(
     discovery: &ConnectorDiscovery,
     session_id: Option<&str>,
     protocol_revision: &str,
     body: &[u8],
-) -> Result<(u16, Option<String>, Vec<u8>)> {
-    if !supports_protocol_revision(protocol_revision) {
-        return Err(anyhow!("mcpd_protocol_revision_invalid"));
-    }
-    let agent = ureq::AgentBuilder::new()
+    definition: &McpServerDefinition,
+    deadline: ExchangeDeadline,
+    forward_context: bool,
+) -> Result<(u16, Option<String>, Vec<u8>), ExchangeFailure> {
+    let mut builder = ureq::AgentBuilder::new()
         .redirects(0)
-        .timeout_connect(Duration::from_secs(2))
-        .build();
-    let mut request = agent
+        .timeout_connect(deadline.connect);
+    if let Some(read) = deadline.read {
+        builder = builder.timeout_read(read);
+    }
+    if let Some(write) = deadline.write {
+        builder = builder.timeout_write(write);
+    }
+    let mut request = builder
+        .build()
         .post(&discovery.endpoint)
         .set(
             "authorization",
@@ -924,11 +998,13 @@ pub fn connector_exchange(
     // Forward each declared context field whose environment variable is set:
     // the mapping arrives inside the published discovery document, so the
     // connector never carries its own copy.
-    for field in &discovery.context_headers {
-        if let Ok(value) = std::env::var(&field.env)
-            && valid_context_header(&value)
-        {
-            request = request.set(&field.header, &value);
+    if forward_context {
+        for field in &discovery.context_headers {
+            if let Ok(value) = std::env::var(&field.env)
+                && valid_context_header(&value)
+            {
+                request = request.set(&field.header, &value);
+            }
         }
     }
     if let Some(session_id) = session_id {
@@ -937,19 +1013,55 @@ pub fn connector_exchange(
     let response = match request.send_bytes(body) {
         Ok(response) => response,
         Err(ureq::Error::Status(_, response)) => response,
-        Err(_) => return Err(anyhow!("mcpd_connector_transport_failed")),
+        Err(_) => return Err(ExchangeFailure::Transport),
     };
     let status = response.status();
     let session = response.header("mcp-session-id").map(str::to_owned);
     let mut body = Vec::new();
     response
         .into_reader()
-        .take((MAX_MCP_FRAME_BYTES + 1) as u64)
-        .read_to_end(&mut body)?;
-    if body.len() > MAX_MCP_FRAME_BYTES {
-        return Err(anyhow!("mcpd_connector_response_too_large"));
+        .take((definition.max_message_bytes + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| ExchangeFailure::Transport)?;
+    if body.len() > definition.max_message_bytes {
+        return Err(ExchangeFailure::ResponseTooLarge);
     }
     Ok((status, session, body))
+}
+
+/// The connector's exchange with the served endpoint. `definition` carries
+/// the revision set and frame bound the client enforces — the same
+/// `McpServerDefinition` predicate the serving side checks, so server and
+/// client share one rule instead of two copies that could drift.
+pub fn connector_exchange(
+    discovery: &ConnectorDiscovery,
+    session_id: Option<&str>,
+    protocol_revision: &str,
+    body: &[u8],
+    definition: &McpServerDefinition,
+) -> Result<(u16, Option<String>, Vec<u8>)> {
+    if !definition.supports_protocol_revision(protocol_revision) {
+        return Err(anyhow!("mcpd_protocol_revision_invalid"));
+    }
+    exchange(
+        discovery,
+        session_id,
+        protocol_revision,
+        body,
+        definition,
+        ExchangeDeadline {
+            connect: Duration::from_secs(2),
+            read: None,
+            write: None,
+        },
+        true,
+    )
+    .map_err(|failure| {
+        anyhow!(match failure {
+            ExchangeFailure::Transport => "mcpd_connector_transport_failed",
+            ExchangeFailure::ResponseTooLarge => "mcpd_connector_response_too_large",
+        })
+    })
 }
 
 pub fn connector_close_session(discovery: &ConnectorDiscovery, session_id: &str) -> Result<()> {
@@ -974,46 +1086,34 @@ pub fn connector_close_session(discovery: &ConnectorDiscovery, session_id: &str)
 }
 
 /// Bounded health exchange used only by the service's own probe. Tight
-/// deadlines keep the monitor responsive and never carry caller context.
+/// deadlines keep the monitor responsive, the probe never carries caller
+/// context, and it speaks the served definition's own revision — a
+/// host-built definition is probed on its own terms.
 fn health_exchange(
     discovery: &ConnectorDiscovery,
     session_id: Option<&str>,
     body: &[u8],
+    definition: &McpServerDefinition,
 ) -> Result<(u16, Option<String>, Vec<u8>)> {
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(Duration::from_secs(1))
-        .timeout_read(Duration::from_secs(2))
-        .timeout_write(Duration::from_secs(2))
-        .build();
-    let mut request = agent
-        .post(&discovery.endpoint)
-        .set(
-            "authorization",
-            &format!("Bearer {}", discovery.bearer_token),
-        )
-        .set("content-type", "application/json")
-        .set("accept", "application/json")
-        .set("mcp-protocol-version", PROTOCOL_REVISION);
-    if let Some(session_id) = session_id {
-        request = request.set("mcp-session-id", session_id);
-    }
-    let response = match request.send_bytes(body) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(_) => return Err(anyhow!("mcpd_health_transport_failed")),
-    };
-    let status = response.status();
-    let session = response.header("mcp-session-id").map(str::to_owned);
-    let mut body = Vec::new();
-    response
-        .into_reader()
-        .take((MAX_MCP_FRAME_BYTES + 1) as u64)
-        .read_to_end(&mut body)?;
-    if body.len() > MAX_MCP_FRAME_BYTES {
-        return Err(anyhow!("mcpd_health_response_too_large"));
-    }
-    Ok((status, session, body))
+    exchange(
+        discovery,
+        session_id,
+        definition.protocol_revision,
+        body,
+        definition,
+        ExchangeDeadline {
+            connect: Duration::from_secs(1),
+            read: Some(Duration::from_secs(2)),
+            write: Some(Duration::from_secs(2)),
+        },
+        false,
+    )
+    .map_err(|failure| {
+        anyhow!(match failure {
+            ExchangeFailure::Transport => "mcpd_health_transport_failed",
+            ExchangeFailure::ResponseTooLarge => "mcpd_health_response_too_large",
+        })
+    })
 }
 
 fn valid_context_header(value: &str) -> bool {

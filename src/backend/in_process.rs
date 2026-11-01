@@ -65,6 +65,7 @@ mod tests {
             arguments: &Map::new(),
             caller: &caller,
             channel: Channel::Control,
+            effect: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let result = backend.call(&request).unwrap();

@@ -80,6 +80,10 @@ impl McpApplication for Dispatcher {
         self.registry.catalog()
     }
 
+    fn has_tool(&self, name: &str) -> bool {
+        self.registry.has_tool(name)
+    }
+
     fn validate_tool_arguments(&self, name: &str, arguments: &Map<String, Value>) -> bool {
         self.registry.validate_tool_arguments(name, arguments)
     }

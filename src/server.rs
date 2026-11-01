@@ -37,6 +37,9 @@ pub struct McpApplicationError {
     pub stage: &'static str,
     pub retryable: bool,
     pub recovery: &'static str,
+    /// Whether the failed request may already have executed at the backend —
+    /// the verdict a caller needs before it may safely replay an effect call.
+    pub request_may_have_executed: bool,
 }
 
 impl McpApplicationError {
@@ -46,6 +49,7 @@ impl McpApplicationError {
             stage,
             retryable: false,
             recovery: "correct_request_and_retry",
+            request_may_have_executed: false,
         }
     }
 
@@ -55,6 +59,20 @@ impl McpApplicationError {
             stage,
             retryable: true,
             recovery: "retry_after_recovery",
+            request_may_have_executed: false,
+        }
+    }
+
+    /// The request left the boundary and its answer was lost: whether the
+    /// call executed is unknown, so an effect-bearing call must never be
+    /// replayed blindly — the caller reconciles before deciding.
+    pub const fn outcome_unknown(stage: &'static str) -> Self {
+        Self {
+            code: "mcp_outcome_unknown",
+            stage,
+            retryable: false,
+            recovery: "reconcile_before_retry",
+            request_may_have_executed: true,
         }
     }
 }
@@ -68,6 +86,10 @@ pub trait McpApplication: Send + Sync {
     type CallerContext: Send + Sync;
 
     fn tool_catalog(&self) -> Vec<Value>;
+    /// Whether the union catalog routes `name` — the cheap membership check
+    /// `tools/call` needs before validation; `tool_catalog` is served to
+    /// `tools/list` only and must never be cloned into this hot path.
+    fn has_tool(&self, name: &str) -> bool;
     fn validate_tool_arguments(&self, name: &str, arguments: &Map<String, Value>) -> bool;
     fn call_tool(
         &self,
@@ -295,12 +317,7 @@ where
         let Some(arguments) = params.get("arguments").and_then(Value::as_object) else {
             return rpc_error(Some(id), -32602, "Invalid params", None);
         };
-        if !self
-            .application
-            .tool_catalog()
-            .iter()
-            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-        {
+        if !self.application.has_tool(name) {
             return rpc_error(Some(id), -32601, "Method not found", None);
         }
         if !self.application.validate_tool_arguments(name, arguments) {
@@ -332,6 +349,7 @@ where
                     "stage": error.stage,
                     "retryable": error.retryable,
                     "recovery": error.recovery,
+                    "requestMayHaveExecuted": error.request_may_have_executed,
                 }),
                 true,
             ),

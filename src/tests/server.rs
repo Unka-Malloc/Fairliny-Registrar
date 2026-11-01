@@ -13,6 +13,10 @@ impl McpApplication for FixtureApp {
         })]
     }
 
+    fn has_tool(&self, name: &str) -> bool {
+        name == "fixture_tool"
+    }
+
     fn validate_tool_arguments(&self, name: &str, arguments: &Map<String, Value>) -> bool {
         name == "fixture_tool" && arguments.is_empty()
     }

@@ -34,7 +34,17 @@ pub mod transport;
 mod windows_private_state;
 pub mod wire;
 
-pub use application::Dispatcher;
+/// The documented integration modes, included so the advertised SDK surface
+/// is compiled as a doctest and can never silently rot.
+#[doc(hidden)]
+#[doc = include_str!("../docs/integration-modes.md")]
+mod integration_modes {}
+
+pub use application::{
+    COMPATIBLE_PROTOCOL_REVISIONS, Dispatcher, MAX_MCP_FRAME_BYTES, PROTOCOL_REVISION,
+    supports_protocol_revision,
+};
+pub use backend::{InProcessBackend, NativeBackend, NativeSpec, REQUEST_PLACEHOLDER};
 pub use registry::{CallerContext, ContextField, Registration, Registry, ToolSpec};
 pub use server::*;
 pub use wire::*;

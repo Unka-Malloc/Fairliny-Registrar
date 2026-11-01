@@ -21,6 +21,13 @@
 //! Accepted work carries no internal deadline: once a request is written, the
 //! call waits for its reply for as long as the child takes. EOF mid-call is a
 //! transport failure, never an implicit cancel.
+//!
+//! Failures split at the write boundary: a request that never fully left the
+//! pipe cannot have executed, so it stays retryable; once the request line
+//! was written the child may have run it — a missing, malformed or refused
+//! reply then leaves the outcome unknown, and an effect-bearing call is
+//! reported `mcp_outcome_unknown` (`requestMayHaveExecuted`, never retryable)
+//! instead of inviting a replay that could double a real-world effect.
 
 use crate::McpApplicationError;
 use crate::registry::{Channel, ToolHandler, ToolRequest};
@@ -30,12 +37,31 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// The invoke-argv element replaced by the serialized call envelope.
 pub const REQUEST_PLACEHOLDER: &str = "{request}";
 
 const DEFAULT_WORKFLOW_ID: &str = "mcpd-service";
 const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// The grace a dropped session gives its child to notice stdin EOF and exit
+/// before teardown escalates to `kill`. Teardown is bounded so a wedged
+/// child can never hold a dropping thread — or the worker permit behind it —
+/// forever; the unbounded wait stays on the reply path, where it belongs.
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// How far a session exchange got before it failed — the distinction an
+/// effect-bearing call needs for its retry verdict.
+enum SessionFailure {
+    /// The request never fully left the pipe: the child cannot have
+    /// dispatched it, so the call is safe to retry.
+    Unsent,
+    /// The request line was written and flushed — whether the child ran it
+    /// is unknown, so an effect-bearing call must not be replayed blindly.
+    Sent,
+}
 
 /// How one native child speaks: the program and argv that start it, the frame
 /// protocol name, the workflow label every frame carries, and the argv
@@ -131,13 +157,14 @@ impl ChildSession {
         })
     }
 
-    fn execute(&mut self, spec: &NativeSpec, args: Vec<String>) -> Result<Value> {
+    fn execute(
+        &mut self,
+        spec: &NativeSpec,
+        args: Vec<String>,
+    ) -> std::result::Result<Value, SessionFailure> {
         self.sequence += 1;
         let id = self.sequence.to_string();
-        let input = self
-            .input
-            .as_mut()
-            .ok_or_else(|| anyhow!("mcpd_backend_unavailable"))?;
+        let input = self.input.as_mut().ok_or(SessionFailure::Unsent)?;
         serde_json::to_writer(
             &mut *input,
             &json!({
@@ -147,32 +174,34 @@ impl ChildSession {
                 "method": "execute",
                 "args": args,
             }),
-        )?;
-        input.write_all(b"\n")?;
-        input.flush()?;
+        )
+        .map_err(|_| SessionFailure::Unsent)?;
+        input.write_all(b"\n").map_err(|_| SessionFailure::Unsent)?;
+        // The newline completes the request line inside the pipe: from here
+        // the child may have read and run the call, so every later failure —
+        // EOF, a desynced frame, a refused `ok` — leaves its outcome unknown.
+        input.flush().map_err(|_| SessionFailure::Sent)?;
         // No task deadline. EOF is a transport failure, never an implicit
         // cancel — a viable call runs to completion.
         let mut bytes = Vec::new();
         let count = (&mut self.output)
             .take(spec.max_frame_bytes as u64 + 1)
-            .read_until(b'\n', &mut bytes)?;
+            .read_until(b'\n', &mut bytes)
+            .map_err(|_| SessionFailure::Sent)?;
         if count == 0 || bytes.last() != Some(&b'\n') || bytes.len() > spec.max_frame_bytes {
-            return Err(anyhow!("mcpd_backend_response_invalid"));
+            return Err(SessionFailure::Sent);
         }
-        let frame: Value = serde_json::from_slice(&bytes)?;
+        let frame: Value = serde_json::from_slice(&bytes).map_err(|_| SessionFailure::Sent)?;
         if frame["protocol"] != spec.protocol
             || frame["id"] != id
             || frame["workflowId"] != spec.workflow_id
         {
-            return Err(anyhow!("mcpd_backend_response_invalid"));
+            return Err(SessionFailure::Sent);
         }
         if frame["ok"] != true {
-            return Err(anyhow!("mcpd_backend_request_failed"));
+            return Err(SessionFailure::Sent);
         }
-        frame
-            .get("result")
-            .cloned()
-            .ok_or_else(|| anyhow!("mcpd_backend_response_invalid"))
+        frame.get("result").cloned().ok_or(SessionFailure::Sent)
     }
 }
 
@@ -180,8 +209,27 @@ impl Drop for ChildSession {
     fn drop(&mut self) {
         drop(self.input.take());
         // Closing this session never kills peer sessions or the work the
-        // child already finished; reap it so it cannot zombie.
-        let _ = self.child.wait();
+        // child already finished; reap it so it cannot zombie — but bound
+        // the teardown: a child that ignores stdin EOF gets a short grace
+        // to exit, then is killed and reaped, so a wedged child can never
+        // block the dropping thread (or the permit behind it) forever.
+        let deadline = Instant::now() + CHILD_EXIT_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // The grace expired or the child can no longer be observed:
+                // kill it and collect — reaping after a kill is bounded, so
+                // teardown never waits on a wedged child.
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -231,10 +279,17 @@ impl ToolHandler for NativeBackend {
                 })?
                 .push(session);
         }
-        // Backend failures surface as retryable: the child may be restarted
-        // and the call retried without changing its meaning.
-        response
-            .map_err(|_| McpApplicationError::retryable("native_backend_unavailable", "backend"))
+        // The retry verdict splits at the write boundary: a request the
+        // child could never have seen stays retryable (`native_backend_unavailable`),
+        // while anything after the request line left leaves the outcome
+        // unknown — an effect-bearing call is then reported
+        // `mcp_outcome_unknown` and never replayed.
+        response.map_err(|failure| match failure {
+            SessionFailure::Sent if request.effect => {
+                McpApplicationError::outcome_unknown("backend")
+            }
+            _ => McpApplicationError::retryable("native_backend_unavailable", "backend"),
+        })
     }
 }
 
@@ -286,6 +341,7 @@ mod tests {
             arguments,
             caller,
             channel,
+            effect: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }

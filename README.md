@@ -29,7 +29,7 @@ mcpd connector --caller <provider>                 # stdio bridge for a caller
 - **Collision = startup error** — two registrations declaring the same tool
   name refuse the whole config before anything serves. Never first-come-wins.
 - **Backends** — `NativeBackend` pools child processes speaking a bounded
-  newline-framed JSON protocol (`BackendSpec.program + args`, `{request}`
+  newline-framed JSON protocol (`NativeSpec.program + args`, `{request}`
   placeholder in `invoke`, separate control pool); `InProcessBackend` takes a
   Rust trait-object handler for embedding hosts.
 - **Callers** — each admitted caller gets a fresh bearer token per service

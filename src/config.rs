@@ -278,7 +278,7 @@ protocol = "mcpd.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "shared"
-input_schema_json = "{\"type\":\"object\",\"properties\":{}}"
+input_schema_json = "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{}}"
 [[service]]
 name = "beta"
 callers = ["cursor"]
@@ -288,7 +288,7 @@ protocol = "mcpd.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "shared"
-input_schema_json = "{\"type\":\"object\",\"properties\":{}}"
+input_schema_json = "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{}}"
 "##;
         let file = file(service);
         let error = build(&file)
@@ -311,7 +311,7 @@ protocol = "mcpd.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "real_tool"
-input_schema_json = "{\"type\":\"object\",\"properties\":{}}"
+input_schema_json = "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{}}"
 "##,
         );
         let error = build(&file)
@@ -358,7 +358,7 @@ protocol = "mcpd.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "t"
-input_schema_json = "{}"
+input_schema_json = "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{}}"
 "##,
         );
         let error = build(&file)

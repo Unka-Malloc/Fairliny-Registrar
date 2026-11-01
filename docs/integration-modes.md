@@ -10,15 +10,15 @@ and which transport faces the caller.
 A Rust host links `mcp-dispatcher`, builds `Registration`s in code and
 serves them directly — no TOML, no child config parsing.
 
-```rust
+```rust,no_run
 use mcp_dispatcher::{
-    CallerContext, Dispatcher, InProcessBackend, McpServerDefinition,
-    McpServerEngine, Registration, ToolSpec, serve_stdio,
-    COMPATIBLE_PROTOCOL_REVISIONS, MAX_MCP_FRAME_BYTES, PROTOCOL_REVISION,
+    CallerContext, COMPATIBLE_PROTOCOL_REVISIONS, Dispatcher, InProcessBackend,
+    MAX_MCP_FRAME_BYTES, McpServerDefinition, McpServerEngine, PROTOCOL_REVISION,
+    Registration, ToolSpec, serve_stdio,
 };
 
-let tools = vec![
-    ToolSpec::declared(
+fn main() -> anyhow::Result<()> {
+    let tools = vec![ToolSpec::declared(
         "my_tool",
         Some("does one thing"),
         serde_json::json!({
@@ -29,38 +29,41 @@ let tools = vec![
         }),
         false, // control-channel reservation
         false, // effect-bearing
-    )?,
-];
+    )?];
 
-let registration = Registration::new(
-    "my-service",
-    "1.0.0",
-    tools,
-    vec!["my-caller".to_owned()],
-    InProcessBackend::new(|request| {
-        // request.tool, request.arguments, request.caller, request.channel,
-        // request.cancelled (cooperative cancellation flag)
-        Ok(serde_json::json!({"echo": request.arguments}))
-    }),
-)?;
+    let registration = Registration::new(
+        "my-service",
+        "1.0.0",
+        tools,
+        vec!["my-caller".to_owned()],
+        InProcessBackend::new(|request| {
+            // request.tool, request.arguments, request.caller, request.channel,
+            // request.effect, request.cancelled (cooperative cancellation flag)
+            Ok(serde_json::json!({"echo": request.arguments}))
+        }),
+    )?;
 
-let dispatcher = Dispatcher::from_registrations(vec![registration])?;
-let engine = McpServerEngine::new(
-    McpServerDefinition {
-        protocol_revision: PROTOCOL_REVISION,
-        compatible_protocol_revisions: COMPATIBLE_PROTOCOL_REVISIONS,
-        server_name: "my-dispatcher",
-        server_version: env!("CARGO_PKG_VERSION"),
-        max_message_bytes: MAX_MCP_FRAME_BYTES,
-    },
-    dispatcher,
-)?;
-let caller = CallerContext {
-    provider_id: "my-caller".to_owned(),
-    attributes: Default::default(),
-    authenticated: true,
-};
-serve_stdio(&engine, &caller, stdin.lock(), stdout)?;
+    let dispatcher = Dispatcher::from_registrations(vec![registration])?;
+    let engine = McpServerEngine::new(
+        McpServerDefinition {
+            protocol_revision: PROTOCOL_REVISION,
+            compatible_protocol_revisions: COMPATIBLE_PROTOCOL_REVISIONS,
+            server_name: "my-dispatcher",
+            server_version: env!("CARGO_PKG_VERSION"),
+            max_message_bytes: MAX_MCP_FRAME_BYTES,
+        },
+        dispatcher,
+    )?;
+    let caller = CallerContext {
+        provider_id: "my-caller".to_owned(),
+        attributes: Default::default(),
+        authenticated: true,
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    serve_stdio(&engine, &caller, stdin.lock(), stdout.lock())?;
+    Ok(())
+}
 ```
 
 - Use `InProcessBackend` when the handler is Rust code in the same process.

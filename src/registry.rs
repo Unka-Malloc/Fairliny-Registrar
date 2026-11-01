@@ -140,6 +140,10 @@ pub struct ToolRequest<'a> {
     pub arguments: &'a Map<String, Value>,
     pub caller: &'a CallerContext,
     pub channel: Channel,
+    /// The owning spec's effect flag: a backend failure after the request
+    /// left the boundary has an unknown outcome, so an effect call must be
+    /// reported `mcp_outcome_unknown` and never marked retryable.
+    pub effect: bool,
     pub cancelled: Arc<AtomicBool>,
 }
 
@@ -168,7 +172,9 @@ pub struct ToolSpec {
 
 impl ToolSpec {
     /// `catalog_entry` is served as-is by `tools/list`; it must carry `name`
-    /// (valid tool grammar) and an object `inputSchema`.
+    /// (valid tool grammar) and a closed object `inputSchema` — the same
+    /// admission shape the engine enforces, checked here so a non-object or
+    /// non-closed declaration fails startup instead of misbehaving later.
     pub fn new(catalog_entry: Value, control: bool, effect: bool) -> Result<Self> {
         let name = catalog_entry
             .get("name")
@@ -180,6 +186,7 @@ impl ToolSpec {
             .filter(|schema| schema.is_object())
             .cloned()
             .ok_or_else(|| anyhow!("mcpd_tool_spec_invalid"))?;
+        ensure!(closed_input_schema(&input_schema), "mcpd_tool_spec_invalid");
         Ok(Self {
             name: name.to_owned(),
             catalog_entry,
@@ -347,6 +354,12 @@ impl Registry {
         self.catalog.clone()
     }
 
+    /// Whether the union catalog routes `name` — one routing-table lookup,
+    /// never a catalog clone.
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.routes.contains_key(name)
+    }
+
     /// The union tool names in catalog order — the health probe's contract.
     pub fn catalog_names(&self) -> Vec<String> {
         self.catalog
@@ -425,9 +438,34 @@ impl Registry {
             } else {
                 Channel::General
             },
+            effect: spec.effect(),
             cancelled: context.cancelled,
         })
     }
+}
+
+/// The closed object shape `ToolSpec` admission requires and the docs
+/// promise: `type` is `"object"`, `properties` is an object of per-property
+/// schemas, `additionalProperties` is exactly `false`, and `required` — when
+/// present — is a list naming only declared properties. A schema missing any
+/// of these either rejects every call (no `properties`, a `required` naming
+/// nothing declared) or is silently treated as closed anyway (open schema):
+/// both are declaration defects refused at startup, never served.
+fn closed_input_schema(schema: &Value) -> bool {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && schema.get("additionalProperties") == Some(&Value::Bool(false))
+        && properties.values().all(Value::is_object)
+        && schema.get("required").is_none_or(|required| {
+            required.as_array().is_some_and(|names| {
+                names.iter().all(|name| {
+                    name.as_str()
+                        .is_some_and(|name| properties.contains_key(name))
+                })
+            })
+        })
 }
 
 // Validate the closed scalar schemas registrations declare, without carrying
@@ -669,23 +707,45 @@ mod tests {
     }
 
     #[test]
-    fn tool_specs_require_a_valid_name_and_object_schema() {
+    fn tool_specs_require_a_valid_name_and_closed_object_schema() {
         assert!(
             ToolSpec::new(
-                json!({"name":"ok_tool","inputSchema":{"type":"object"}}),
+                json!({"name":"ok_tool","inputSchema":{
+                    "type":"object","additionalProperties":false,
+                    "properties":{"text":{"type":"string"}},"required":["text"]
+                }}),
                 false,
                 false
             )
             .is_ok()
         );
         for entry in [
-            json!({"name":"has space","inputSchema":{"type":"object"}}),
-            json!({"name":"","inputSchema":{"type":"object"}}),
+            // Tool-name grammar and a present object inputSchema.
+            json!({"name":"has space","inputSchema":{"type":"object","additionalProperties":false,"properties":{}}}),
+            json!({"name":"","inputSchema":{"type":"object","additionalProperties":false,"properties":{}}}),
             json!({"name":"ok","inputSchema":"object"}),
             json!({"name":"ok"}),
-            json!({"inputSchema":{"type":"object"}}),
+            json!({"inputSchema":{"type":"object","additionalProperties":false,"properties":{}}}),
+            // A non-object schema type.
+            json!({"name":"ok","inputSchema":{"type":"string","additionalProperties":false,"properties":{}}}),
+            // An open schema is silently treated as closed downstream —
+            // refuse it at declaration instead of serving the lie.
+            json!({"name":"ok","inputSchema":{"type":"object","properties":{}}}),
+            json!({"name":"ok","inputSchema":{"type":"object","additionalProperties":true,"properties":{}}}),
+            // No `properties` admits nothing but then rejects every call.
+            json!({"name":"ok","inputSchema":{"type":"object","additionalProperties":false}}),
+            // A `required` name the schema does not declare rejects every
+            // call; a non-list `required` is malformed outright.
+            json!({"name":"ok","inputSchema":{"type":"object","additionalProperties":false,"properties":{},"required":["missing"]}}),
+            json!({"name":"ok","inputSchema":{"type":"object","additionalProperties":false,"properties":{},"required":"yes"}}),
+            // A property that is not an object schema rejects every call
+            // that supplies it.
+            json!({"name":"ok","inputSchema":{"type":"object","additionalProperties":false,"properties":{"text":"string"}}}),
         ] {
-            assert!(ToolSpec::new(entry, false, false).is_err());
+            assert!(
+                ToolSpec::new(entry.clone(), false, false).is_err(),
+                "must be refused: {entry}"
+            );
         }
     }
 
