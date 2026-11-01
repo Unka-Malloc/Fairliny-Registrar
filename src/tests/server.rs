@@ -13,9 +13,8 @@ impl McpApplication for FixtureApp {
         })]
     }
 
-    fn has_tool(&self, name: &str) -> bool {
-        name == "fixture_tool"
-    }
+    // `has_tool` is deliberately not overridden: the fixture exercises the
+    // trait's catalog-walking default on every `tools/call` below.
 
     fn validate_tool_arguments(&self, name: &str, arguments: &Map<String, Value>) -> bool {
         name == "fixture_tool" && arguments.is_empty()

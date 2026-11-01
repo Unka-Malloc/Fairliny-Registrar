@@ -86,10 +86,16 @@ pub trait McpApplication: Send + Sync {
     type CallerContext: Send + Sync;
 
     fn tool_catalog(&self) -> Vec<Value>;
-    /// Whether the union catalog routes `name` — the cheap membership check
-    /// `tools/call` needs before validation; `tool_catalog` is served to
-    /// `tools/list` only and must never be cloned into this hot path.
-    fn has_tool(&self, name: &str) -> bool;
+    /// Whether the union catalog routes `name` — the membership check
+    /// `tools/call` needs before validation. The default walks the served
+    /// catalog, so an application needs no extra surface to be correct; an
+    /// application holding a routing table (the `Dispatcher`) overrides it
+    /// so the hot path never clones the catalog.
+    fn has_tool(&self, name: &str) -> bool {
+        self.tool_catalog()
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+    }
     fn validate_tool_arguments(&self, name: &str, arguments: &Map<String, Value>) -> bool;
     fn call_tool(
         &self,

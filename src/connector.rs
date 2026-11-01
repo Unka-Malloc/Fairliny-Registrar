@@ -131,9 +131,11 @@ fn run(args: &[String]) -> Result<(), ()> {
     let mut reader = stdin.lock();
     let writer = Arc::new(Mutex::new(io::stdout()));
     let definition = connector_definition();
-    let mut session_id: Option<String> = None;
-    let mut initialization: Option<McpMessage> = None;
-    let mut protocol_revision = PROTOCOL_REVISION.to_owned();
+    let session = Arc::new(Mutex::new(ConnectorSession {
+        id: None,
+        initialize: None,
+        protocol_revision: PROTOCOL_REVISION.to_owned(),
+    }));
     let mut workers = Vec::<thread::JoinHandle<Result<(), ()>>>::new();
     let result = (|| -> Result<(), ()> {
         loop {
@@ -171,52 +173,62 @@ fn run(args: &[String]) -> Result<(), ()> {
                     continue;
                 }
             };
-            if current != discovery {
-                discovery = current;
-                session_id = None;
-            }
-            if session_id.is_none()
-                && initialize_protocol_revision(&message).is_none()
-                && let Some(initialize) = initialization.as_ref()
-            {
-                let body =
-                    encode_http_body(initialize, definition.max_message_bytes).map_err(|_| ())?;
-                match connector_exchange(&discovery, None, &protocol_revision, &body, &definition) {
-                    Ok((200, Some(id), _)) => {
-                        session_id = Some(id);
-                    }
-                    _ => {
-                        module_unavailable(&message, &writer, &discovery, false)?;
-                        continue;
+            // Record the client's own handshake before the frame is
+            // dispatched: any worker that finds the session reaped replays
+            // this verbatim initialize to mint the replacement.
+            let (live_id, revision, has_initialize) = {
+                let mut guard = session.lock().map_err(|_| ())?;
+                if current != discovery {
+                    discovery = current;
+                    guard.id = None;
+                }
+                if initialize_protocol_revision(&message).is_some() {
+                    guard.initialize = Some(message.clone());
+                }
+                if guard.id.is_none()
+                    && let Some(requested) = initialize_protocol_revision(&message)
+                    && definition.supports_protocol_revision(requested)
+                {
+                    guard.protocol_revision = requested.to_owned();
+                }
+                (
+                    guard.id.clone(),
+                    guard.protocol_revision.clone(),
+                    guard.initialize.is_some(),
+                )
+            };
+            // A non-initialize frame with no live session mints one by
+            // replaying the stored initialize before it is dispatched.
+            let live_id = match live_id {
+                Some(id) => Some(id),
+                None if has_initialize && initialize_protocol_revision(&message).is_none() => {
+                    match heal_session(&session, None, &discovery, &definition) {
+                        Some(id) => Some(id),
+                        None => {
+                            module_unavailable(&message, &writer, &discovery, false)?;
+                            continue;
+                        }
                     }
                 }
-            }
-            if initialize_protocol_revision(&message).is_some() {
-                initialization = Some(message.clone());
-            }
-            if session_id.is_none()
-                && let Some(requested) = initialize_protocol_revision(&message)
-                && definition.supports_protocol_revision(requested)
-            {
-                protocol_revision = requested.to_owned();
-            }
-            if let Some(session_id) = session_id.clone() {
+                None => None,
+            };
+            if let Some(session_id) = live_id {
                 if workers.len() >= MAX_IN_FLIGHT_FRAMES {
                     return Err(());
                 }
                 let discovery = discovery.clone();
                 let definition = definition.clone();
-                let protocol_revision = protocol_revision.clone();
                 let writer = Arc::clone(&writer);
+                let session = Arc::clone(&session);
                 workers.push(thread::spawn(move || {
                     forward(
                         &discovery,
                         Some(&session_id),
-                        None,
-                        &protocol_revision,
+                        &revision,
                         &definition,
                         message,
                         &writer,
+                        &session,
                     )
                     .map(|_| ())
                 }));
@@ -224,13 +236,13 @@ fn run(args: &[String]) -> Result<(), ()> {
                 let returned_session = forward(
                     &discovery,
                     None,
-                    Some(&mut session_id),
-                    &protocol_revision,
+                    &revision,
                     &definition,
                     message,
                     &writer,
+                    &session,
                 )?;
-                session_id = returned_session;
+                session.lock().map_err(|_| ())?.id = returned_session;
             }
         }
         Ok(())
@@ -248,83 +260,199 @@ fn run(args: &[String]) -> Result<(), ()> {
             result = Err(());
         }
     }
-    if let Some(session_id) = session_id.as_deref() {
+    if let Ok(guard) = session.lock()
+        && let Some(session_id) = guard.id.as_deref()
+    {
         let _ = connector_close_session(&discovery, session_id);
     }
     result
 }
 
-fn forward(
+/// The connector's live server session, shared with the in-flight forward
+/// workers so whichever of them first meets a reaped session mints the
+/// replacement for everyone. `id` is the session the next session-bound
+/// frame rides; `initialize` is the client's verbatim handshake, replayed
+/// to mint that replacement; `protocol_revision` is the revision header
+/// the session negotiated and every session-bound frame must carry.
+struct ConnectorSession {
+    id: Option<String>,
+    initialize: Option<McpMessage>,
+    protocol_revision: String,
+}
+
+/// Whether a session-bound exchange proves the session is gone: the server
+/// refused it outright (404 — the only POST response issued for an unknown
+/// session), or it answered success without echoing the session id the
+/// connector sent. Other refusals (400/415/503) are request failures, not
+/// session loss; a sessionless exchange has nothing to lose.
+fn session_gone(status: u16, session_id: Option<&str>, returned: Option<&str>) -> bool {
+    session_id.is_some()
+        && (status == 404 || (matches!(status, 200 | 202) && returned != session_id))
+}
+
+/// Whether this frame is a call to an effect-bearing tool — decided against
+/// the published discovery set, never a list compiled into the connector.
+/// An effect call whose request left the connector is never resent.
+fn effect_call(message: &McpMessage, discovery: &crate::transport::ConnectorDiscovery) -> bool {
+    matches!(message, McpMessage::Request { method, params, .. }
+        if method == "tools/call"
+            && params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| discovery.effect_tools.iter().any(|tool| tool == name)))
+}
+
+/// Mint a replacement session by replaying the client's stored initialize,
+/// serialized on the session lock so a dead session is healed exactly once
+/// no matter how many in-flight workers meet it. `dead_id` is the session
+/// the caller found gone; if the shared id already moved past it, a peer
+/// healed (or a new handshake superseded) and that live id is reused. The
+/// negotiated revision the replay returns replaces the stored one, so
+/// later frames carry the session's true revision.
+fn heal_session(
+    session: &Mutex<ConnectorSession>,
+    dead_id: Option<&str>,
+    discovery: &crate::transport::ConnectorDiscovery,
+    definition: &McpServerDefinition,
+) -> Option<String> {
+    let mut guard = session.lock().ok()?;
+    if let Some(id) = guard.id.as_ref().filter(|id| Some(id.as_str()) != dead_id) {
+        return Some(id.clone());
+    }
+    guard.id = None;
+    let initialize = guard.initialize.clone()?;
+    let body = encode_http_body(&initialize, definition.max_message_bytes).ok()?;
+    let protocol_revision = guard.protocol_revision.clone();
+    let Ok((200, Some(minted), response)) =
+        connector_exchange(discovery, None, &protocol_revision, &body, definition)
+    else {
+        return None;
+    };
+    if let Ok(response) = crate::decode_http_body(&response, definition.max_message_bytes)
+        && let Some(negotiated) = response
+            .to_value()
+            .pointer("/result/protocolVersion")
+            .and_then(serde_json::Value::as_str)
+    {
+        guard.protocol_revision = negotiated.to_owned();
+    }
+    guard.id = Some(minted.clone());
+    Some(minted)
+}
+
+fn forward<W: Write>(
     discovery: &crate::transport::ConnectorDiscovery,
     session_id: Option<&str>,
-    allocated_session: Option<&mut Option<String>>,
     protocol_revision: &str,
     definition: &McpServerDefinition,
     message: McpMessage,
-    writer: &Mutex<io::Stdout>,
+    writer: &Mutex<W>,
+    session: &Mutex<ConnectorSession>,
 ) -> Result<Option<String>, ()> {
     let body = encode_http_body(&message, definition.max_message_bytes).map_err(|_| ())?;
-    let (status, returned_session, response) =
-        match connector_exchange(discovery, session_id, protocol_revision, &body, definition) {
+    let mut attempt_session = session_id.map(str::to_owned);
+    // A reaped session buys this frame exactly one retry on the healed
+    // session — never more, and never at all for an effect call.
+    let mut retried = false;
+    loop {
+        let (status, returned_session, response) = match connector_exchange(
+            discovery,
+            attempt_session.as_deref(),
+            protocol_revision,
+            &body,
+            definition,
+        ) {
             Ok(response) => response,
             Err(_) => {
                 module_unavailable(&message, writer, discovery, true)?;
-                return Ok(session_id.map(str::to_owned));
+                return Ok(attempt_session);
             }
         };
-    if session_id.is_none()
-        && let Some(allocated_session) = allocated_session
-    {
-        *allocated_session = returned_session.clone();
-    }
-    if session_id.is_some() && returned_session.as_deref() != session_id {
-        module_unavailable(&message, writer, discovery, status == 200)?;
-        return Ok(session_id.map(str::to_owned));
-    }
-    match status {
-        200 => {
-            let response = match crate::decode_http_body(&response, definition.max_message_bytes) {
-                Ok(response) => response,
-                Err(_) => {
-                    module_unavailable(&message, writer, discovery, true)?;
-                    return Ok(returned_session);
+        if session_gone(
+            status,
+            attempt_session.as_deref(),
+            returned_session.as_deref(),
+        ) {
+            // The service reaped the session the connector still held. Mint
+            // a replacement by replaying the stored initialize, then settle
+            // this frame: an effect call is never resent (the no-replay
+            // rule), so its lost answer is reported outcome-unknown; any
+            // other frame is retried once on the healed session.
+            let healed = heal_session(session, attempt_session.as_deref(), discovery, definition);
+            if effect_call(&message, discovery) {
+                module_unavailable(&message, writer, discovery, true)?;
+                return Ok(healed);
+            }
+            match healed {
+                Some(healed_id) if !retried => {
+                    retried = true;
+                    attempt_session = Some(healed_id);
+                    continue;
                 }
-            };
-            let mut writer = writer.lock().map_err(|_| ())?;
-            writer
-                .write_all(&encode_stdio_line(&response, MAX_MCP_FRAME_BYTES).map_err(|_| ())?)
-                .map_err(|_| ())?;
-            writer.flush().map_err(|_| ())?;
+                _ => {
+                    module_unavailable(&message, writer, discovery, false)?;
+                    return Ok(healed);
+                }
+            }
         }
-        202 if response.is_empty() => {}
-        _ => {
+        if attempt_session.is_some() && returned_session.as_deref() != attempt_session.as_deref() {
             module_unavailable(&message, writer, discovery, false)?;
-            return Ok(session_id.map(str::to_owned));
+            return Ok(attempt_session);
         }
+        match status {
+            200 => {
+                let response =
+                    match crate::decode_http_body(&response, definition.max_message_bytes) {
+                        Ok(response) => response,
+                        Err(_) => {
+                            module_unavailable(&message, writer, discovery, true)?;
+                            return Ok(returned_session);
+                        }
+                    };
+                // Adopt the revision the server negotiated: a mid-session
+                // re-initialize moves the session's revision, and later
+                // frames must carry it to stay admissible.
+                if initialize_protocol_revision(&message).is_some()
+                    && let Some(negotiated) = response
+                        .to_value()
+                        .pointer("/result/protocolVersion")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                    && let Ok(mut guard) = session.lock()
+                {
+                    guard.protocol_revision = negotiated;
+                }
+                let mut writer = writer.lock().map_err(|_| ())?;
+                writer
+                    .write_all(&encode_stdio_line(&response, MAX_MCP_FRAME_BYTES).map_err(|_| ())?)
+                    .map_err(|_| ())?;
+                writer.flush().map_err(|_| ())?;
+            }
+            202 if response.is_empty() => {}
+            _ => {
+                module_unavailable(&message, writer, discovery, false)?;
+                return Ok(attempt_session);
+            }
+        }
+        return Ok(returned_session);
     }
-    Ok(returned_session)
 }
 
 /// A call to an effect-bearing tool whose request already left the connector
 /// has an uncertain outcome — it may have executed. The response marks it
 /// `mcp_outcome_unknown` and forbids replay; every other failure is a plain
 /// module-unavailable error the client may retry after recovery.
-fn module_unavailable(
+fn module_unavailable<W: Write>(
     message: &McpMessage,
-    writer: &Mutex<io::Stdout>,
+    writer: &Mutex<W>,
     discovery: &crate::transport::ConnectorDiscovery,
     sent: bool,
 ) -> Result<(), ()> {
-    let McpMessage::Request { id, method, params } = message else {
+    let McpMessage::Request { id, .. } = message else {
         return Ok(());
     };
-    let uncertain = sent
-        && method == "tools/call"
-        && params
-            .as_ref()
-            .and_then(|params| params.get("name"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| discovery.effect_tools.iter().any(|tool| tool == name));
+    let uncertain = sent && effect_call(message, discovery);
     let response = McpMessage::error(
         Some(id.clone()),
         -32000,
@@ -410,6 +538,11 @@ fn caller_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{HttpService, load_connector_discovery};
+    use crate::{Dispatcher, InProcessBackend, Registration, ToolSpec};
+    use serde_json::{Map, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|value| (*value).to_owned()).collect()
@@ -543,5 +676,188 @@ mod tests {
         assert!(caller_args.is_empty() && home.is_none());
         assert!(split_home(&args(&["--home"])).is_err());
         assert!(split_home(&args(&["--home", "/a", "--home", "/b"])).is_err());
+    }
+
+    #[test]
+    fn the_session_gone_predicate_needs_a_bound_session() {
+        // Only a session-bound exchange can lose a session: 404 is the
+        // server's only POST answer for an unknown id, and a successful
+        // answer must echo the session it served.
+        assert!(session_gone(404, Some("s"), None));
+        assert!(session_gone(200, Some("s"), None));
+        assert!(session_gone(202, Some("s"), Some("other")));
+        assert!(!session_gone(200, Some("s"), Some("s")));
+        assert!(!session_gone(400, Some("s"), None));
+        assert!(!session_gone(503, Some("s"), None));
+        assert!(!session_gone(404, None, None));
+    }
+
+    /// One caller, one ordinary tool and one effect tool, over a real
+    /// `HttpService` — the smallest deployment the connector side can heal
+    /// against. `calls` counts how often the backend actually ran.
+    fn fixture_service(calls: Arc<AtomicUsize>) -> (HttpService, McpServerDefinition) {
+        let schema = json!({"type":"object","additionalProperties":false,"properties":{}});
+        let dispatcher = Dispatcher::from_registrations(vec![
+            Registration::new(
+                "fixture",
+                "1",
+                vec![
+                    ToolSpec::declared("fixture_tool", None, schema.clone(), false, false).unwrap(),
+                    ToolSpec::declared("fixture_effect", None, schema, false, true).unwrap(),
+                ],
+                vec!["fixture".to_owned()],
+                InProcessBackend::new(move |request| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(json!({"tool": request.tool}))
+                }),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let definition = McpServerDefinition {
+            protocol_revision: PROTOCOL_REVISION,
+            compatible_protocol_revisions: COMPATIBLE_PROTOCOL_REVISIONS,
+            server_name: "fixture-service",
+            server_version: "1",
+            max_message_bytes: MAX_MCP_FRAME_BYTES,
+        };
+        (
+            HttpService::start(dispatcher, definition.clone(), Vec::new()).unwrap(),
+            definition,
+        )
+    }
+
+    fn initialize() -> McpMessage {
+        McpMessage::request(
+            1_i64,
+            "initialize",
+            json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}})
+                .as_object()
+                .cloned(),
+        )
+        .unwrap()
+    }
+
+    fn tool_call(id: i64, name: &str) -> McpMessage {
+        McpMessage::request(
+            id,
+            "tools/call",
+            json!({"name": name, "arguments": {}}).as_object().cloned(),
+        )
+        .unwrap()
+    }
+
+    fn written(writer: &Mutex<Vec<u8>>) -> serde_json::Value {
+        crate::decode_stdio_line(&writer.lock().unwrap(), MAX_MCP_FRAME_BYTES)
+            .unwrap()
+            .to_value()
+    }
+
+    /// The blocking-finding proof: a session reaped for idleness does not
+    /// kill the connector — a session-bound frame on the dead id is healed
+    /// and retried once, transparently, while an effect call is reported
+    /// outcome-unknown and never resent.
+    #[test]
+    fn a_reaped_session_heals_and_effect_calls_stay_uncertain() {
+        let _serial = crate::private_state::STATE_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("mcpd-heal-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        crate::private_state::set_state_root_override(root.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (service, definition) = fixture_service(Arc::clone(&calls));
+        let discovery = load_connector_discovery("fixture").unwrap();
+        let writer = Mutex::new(Vec::<u8>::new());
+        let session = Mutex::new(ConnectorSession {
+            id: None,
+            initialize: Some(initialize()),
+            protocol_revision: PROTOCOL_REVISION.to_owned(),
+        });
+
+        // The client's handshake mints the session — run()'s bookkeeping,
+        // driven directly here.
+        let minted = forward(
+            &discovery,
+            None,
+            PROTOCOL_REVISION,
+            &definition,
+            initialize(),
+            &writer,
+            &session,
+        )
+        .unwrap()
+        .expect("initialize mints a session");
+        session.lock().unwrap().id = Some(minted.clone());
+        writer.lock().unwrap().clear();
+
+        // Idle past the TTL: the next table access reaps the row. A plain
+        // frame on the dead id is healed and retried once — the caller sees
+        // the answer, never an error.
+        service.set_session_idle_ttl(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(80));
+        forward(
+            &discovery,
+            Some(&minted),
+            PROTOCOL_REVISION,
+            &definition,
+            McpMessage::request(2_i64, "tools/list", Some(Map::new())).unwrap(),
+            &writer,
+            &session,
+        )
+        .unwrap();
+        let healed = session.lock().unwrap().id.clone().unwrap();
+        assert_ne!(healed, minted, "the dead session must be replaced");
+        let listed = written(&writer);
+        assert_eq!(listed["id"], 2);
+        assert_eq!(listed["result"]["tools"][0]["name"], "fixture_tool");
+        writer.lock().unwrap().clear();
+
+        // The healed session serves effect calls normally while live.
+        forward(
+            &discovery,
+            Some(&healed),
+            PROTOCOL_REVISION,
+            &definition,
+            tool_call(3, "fixture_effect"),
+            &writer,
+            &session,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        writer.lock().unwrap().clear();
+
+        // Expired again: an effect call meets the dead id. The session is
+        // still healed for the next frame, but the call itself is never
+        // resent — it is reported outcome-unknown.
+        thread::sleep(Duration::from_millis(80));
+        forward(
+            &discovery,
+            Some(&healed),
+            PROTOCOL_REVISION,
+            &definition,
+            tool_call(4, "fixture_effect"),
+            &writer,
+            &session,
+        )
+        .unwrap();
+        let lost = written(&writer);
+        assert_eq!(lost["id"], 4);
+        assert_eq!(lost["error"]["data"]["reasonCode"], "mcp_outcome_unknown");
+        assert_eq!(lost["error"]["data"]["requestMayHaveExecuted"], true);
+        assert_eq!(lost["error"]["data"]["retryable"], false);
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "an effect call is never resent after a reaped session"
+        );
+        let rehealed = session.lock().unwrap().id.clone().unwrap();
+        assert_ne!(rehealed, healed, "the dead session must still be replaced");
+
+        drop(service);
+        crate::private_state::clear_state_root_override();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

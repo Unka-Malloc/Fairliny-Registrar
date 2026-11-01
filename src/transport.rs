@@ -19,7 +19,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -32,7 +32,12 @@ const MAX_TOOL_WORKERS: usize = 8;
 const MAX_CONTEXT_FIELDS: usize = 16;
 const MAX_PUBLISHED_TOOLS: usize = 256;
 /// A session no request has touched within this TTL is reaped on the next
-/// table access: a crashed connector cannot hold its slot forever.
+/// table access: a crashed connector cannot hold its slot forever. The TTL
+/// bounds only how long a *dead* session keeps its slot — a live connector
+/// whose session was reaped mints a replacement by replaying its stored
+/// handshake, so a connector process may idle far longer than this (an
+/// overnight caller is the normal case, not an anomaly). A session with an
+/// in-flight request is never reaped: its answer must reach the caller.
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Serialize, Deserialize)]
@@ -83,6 +88,10 @@ pub struct HttpService {
     probe_identity: ConnectorDiscovery,
     probe_definition: McpServerDefinition,
     probe_catalog: Vec<String>,
+    /// Test-only handle on the reaper's TTL so a test can expire a session
+    /// without waiting out the production idle window.
+    #[cfg(test)]
+    session_idle_ttl: Arc<AtomicU64>,
 }
 
 impl HttpService {
@@ -157,6 +166,7 @@ impl HttpService {
             effect_tools: Vec::new(),
         };
         let stop = Arc::new(AtomicBool::new(false));
+        let session_idle_ttl = Arc::new(AtomicU64::new(SESSION_IDLE_TTL.as_millis() as u64));
         let service = Arc::new(ServiceState {
             application,
             engine,
@@ -165,6 +175,7 @@ impl HttpService {
             context_fields,
             stop: Arc::clone(&stop),
             sessions: Mutex::new(HashMap::new()),
+            session_idle_ttl: Arc::clone(&session_idle_ttl),
             active_connections: AtomicUsize::new(0),
             active_tool_calls: AtomicUsize::new(0),
             active_control_calls: AtomicUsize::new(0),
@@ -190,7 +201,17 @@ impl HttpService {
             probe_identity,
             probe_definition,
             probe_catalog,
+            #[cfg(test)]
+            session_idle_ttl,
         })
+    }
+
+    /// Test-only lever: shrink the reaper's TTL so a test can expire a live
+    /// session on demand instead of waiting out the production idle window.
+    #[cfg(test)]
+    pub(crate) fn set_session_idle_ttl(&self, ttl: Duration) {
+        self.session_idle_ttl
+            .store(ttl.as_millis() as u64, Ordering::Release);
     }
 
     pub fn stopped(&self) -> bool {
@@ -324,6 +345,10 @@ struct ServiceState {
     tokens: HashMap<String, String>,
     context_fields: Vec<ContextField>,
     sessions: Mutex<HashMap<String, ServerSession>>,
+    /// The idle TTL the reaper enforces, in milliseconds. A field rather
+    /// than the bare constant so a test can shrink it without an hour of
+    /// wall-clock idle; production only ever stores `SESSION_IDLE_TTL`.
+    session_idle_ttl: Arc<AtomicU64>,
     active_connections: AtomicUsize,
     active_tool_calls: AtomicUsize,
     active_control_calls: AtomicUsize,
@@ -342,14 +367,51 @@ struct ServerSession {
     /// The last time a request touched this session — the idle clock the
     /// table reaper reads.
     last_seen: Instant,
+    /// Requests admitted against this session that have not yet answered.
+    /// Outstanding work pins the row: the reaper never collects a session
+    /// whose answer the caller is still owed.
+    in_flight: usize,
 }
 
-/// Reap sessions idle past `SESSION_IDLE_TTL`. Runs under the table lock on
-/// every acquisition — the table is bounded (`MAX_SESSIONS`), so the sweep
-/// is cheap and needs no separate reaper thread.
-fn reap_idle_sessions(sessions: &mut HashMap<String, ServerSession>) {
-    let now = Instant::now();
-    sessions.retain(|_, session| now.duration_since(session.last_seen) < SESSION_IDLE_TTL);
+impl ServiceState {
+    fn session_idle_ttl(&self) -> Duration {
+        Duration::from_millis(self.session_idle_ttl.load(Ordering::Acquire))
+    }
+}
+
+/// Reap sessions idle past `ttl`, evaluated against `now` — both injected
+/// so the predicate is decidable in a unit test. Runs under the table lock
+/// on every acquisition — the table is bounded (`MAX_SESSIONS`), so the
+/// sweep is cheap and needs no separate reaper thread. A session with an
+/// in-flight request is never reaped: an answer owed to a caller must not
+/// lose its row mid-flight.
+fn reap_idle_sessions(sessions: &mut HashMap<String, ServerSession>, now: Instant, ttl: Duration) {
+    sessions.retain(|_, session| {
+        session.in_flight > 0 || now.saturating_duration_since(session.last_seen) < ttl
+    });
+}
+
+/// Pins a session row while its request executes; dropping the guard
+/// releases the pin whether the answer left cleanly or the handler bailed.
+struct SessionInFlight<'a> {
+    sessions: &'a Mutex<HashMap<String, ServerSession>>,
+    id: String,
+}
+
+impl Drop for SessionInFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_mut(&self.id)
+        {
+            session.in_flight = session.in_flight.saturating_sub(1);
+            // Finishing a request is the latest touch too: the idle clock
+            // restarts here, so a session busy a moment ago is not reaped.
+            session.last_seen = Instant::now();
+        }
+    }
 }
 
 fn merge_session_caller_binding(
@@ -481,7 +543,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
             .sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        reap_idle_sessions(&mut sessions);
+        reap_idle_sessions(&mut sessions, Instant::now(), service.session_idle_ttl());
         let removed = sessions
             .get(session_id)
             .is_some_and(|session| session.provider == *provider)
@@ -524,7 +586,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
             .sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        reap_idle_sessions(&mut sessions);
+        reap_idle_sessions(&mut sessions, Instant::now(), service.session_idle_ttl());
         if sessions.len() >= MAX_SESSIONS {
             return write_http(&mut stream, 503, &[], b"");
         }
@@ -542,6 +604,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
                 state: Arc::clone(&session),
                 caller: Mutex::new(binding.clone()),
                 last_seen: Instant::now(),
+                in_flight: 1,
             },
         );
         (id, session, binding)
@@ -553,7 +616,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
             .sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        reap_idle_sessions(&mut sessions);
+        reap_idle_sessions(&mut sessions, Instant::now(), service.session_idle_ttl());
         let Some(stored) = sessions
             .get_mut(&id)
             .filter(|session| session.provider == *provider)
@@ -561,6 +624,7 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
             return write_http(&mut stream, 404, &[], b"");
         };
         stored.last_seen = Instant::now();
+        stored.in_flight += 1;
         let session = Arc::clone(&stored.state);
         let binding = {
             let mut guard = stored
@@ -572,6 +636,12 @@ fn handle_connection(mut stream: TcpStream, service: &ServiceState) -> Result<()
             guard.clone()
         };
         (id, session, binding)
+    };
+    // The admitted request pins its session row until the answer leaves:
+    // the reaper keeps any session whose work is still outstanding.
+    let _in_flight = SessionInFlight {
+        sessions: &service.sessions,
+        id: session_id.clone(),
     };
     if !initialize && session.protocol_revision() != request_protocol_revision {
         return write_http(&mut stream, 400, &[], b"");
@@ -1147,6 +1217,7 @@ pub fn connector_health(discovery: &ConnectorDiscovery) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{InProcessBackend, Registration, ToolSpec};
 
     fn context_fields() -> Vec<ContextField> {
         vec![
@@ -1165,6 +1236,254 @@ mod tests {
             )
             .unwrap(),
         ]
+    }
+
+    /// A `ServerSession` fixture carrying exactly the fields the reaper
+    /// predicate reads: last-touch instant and outstanding request count.
+    fn stored_session(last_seen: Instant, in_flight: usize) -> ServerSession {
+        ServerSession {
+            provider: "fixture".to_owned(),
+            state: Arc::new(McpSessionState::default()),
+            caller: Mutex::new(SessionCallerBinding::new()),
+            last_seen,
+            in_flight,
+        }
+    }
+
+    #[test]
+    fn the_reaper_keeps_fresh_and_in_flight_sessions() {
+        let base = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let mut sessions = HashMap::from([
+            ("old-idle".to_owned(), stored_session(base, 0)),
+            ("old-busy".to_owned(), stored_session(base, 1)),
+            (
+                "fresh-idle".to_owned(),
+                stored_session(base + Duration::from_secs(58), 0),
+            ),
+        ]);
+        // Past the TTL an idle row is collected; outstanding work pins its
+        // row no matter how stale the clock reads, and a young idle row is
+        // untouched.
+        reap_idle_sessions(&mut sessions, base + ttl + Duration::from_secs(1), ttl);
+        assert!(!sessions.contains_key("old-idle"));
+        assert!(sessions.contains_key("old-busy"));
+        assert!(sessions.contains_key("fresh-idle"));
+    }
+
+    /// One caller, one tool — the smallest dispatcher `HttpService` serves.
+    /// The caller-supplied handler decides what the backend does.
+    fn fixture_service(handler: InProcessBackend) -> (HttpService, McpServerDefinition) {
+        let dispatcher = Dispatcher::from_registrations(vec![
+            Registration::new(
+                "fixture",
+                "1",
+                vec![
+                    ToolSpec::declared(
+                        "fixture_tool",
+                        None,
+                        serde_json::json!({"type":"object","additionalProperties":false,"properties":{}}),
+                        false,
+                        false,
+                    )
+                    .unwrap(),
+                ],
+                vec!["fixture".to_owned()],
+                handler,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let definition = McpServerDefinition {
+            protocol_revision: crate::application::PROTOCOL_REVISION,
+            compatible_protocol_revisions: crate::application::COMPATIBLE_PROTOCOL_REVISIONS,
+            server_name: "fixture-service",
+            server_version: "1",
+            max_message_bytes: crate::application::MAX_MCP_FRAME_BYTES,
+        };
+        (
+            HttpService::start(dispatcher, definition.clone(), Vec::new()).unwrap(),
+            definition,
+        )
+    }
+
+    /// A unique canonicalized state root installed as the override — the
+    /// caller holds `STATE_ROOT_TEST_LOCK` for the whole test.
+    fn fixture_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("mcpd-{name}-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        crate::private_state::set_state_root_override(root.clone());
+        root
+    }
+
+    /// One exchange, retrying only a connection the boundary shed before any
+    /// answer — the bounded-connection cap legitimately drops what it cannot
+    /// schedule under parallel test load, which says nothing about the
+    /// session behavior under test.
+    fn exchange_or_retry(
+        discovery: &ConnectorDiscovery,
+        session: Option<&str>,
+        body: &[u8],
+        definition: &McpServerDefinition,
+    ) -> (u16, Option<String>, Vec<u8>) {
+        for _ in 0..4 {
+            match connector_exchange(
+                discovery,
+                session,
+                crate::application::PROTOCOL_REVISION,
+                body,
+                definition,
+            ) {
+                Ok(response) => return response,
+                Err(_) => thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        connector_exchange(
+            discovery,
+            session,
+            crate::application::PROTOCOL_REVISION,
+            body,
+            definition,
+        )
+        .expect("the exchange must eventually connect")
+    }
+
+    fn initialize_body(revision: &str) -> Vec<u8> {
+        encode_http_body(
+            &McpMessage::request(
+                1_i64,
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": revision,
+                    "capabilities": {},
+                    "clientInfo": {"name": "fixture", "version": "1"}
+                })
+                .as_object()
+                .cloned(),
+            )
+            .unwrap(),
+            crate::application::MAX_MCP_FRAME_BYTES,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_refused_initialize_frees_its_session_slot() {
+        // A handshake the engine refuses is answered 200 with the JSON-RPC
+        // error and frees the slot it minted: retrying bad handshakes can
+        // never exhaust the bounded table.
+        let _serial = crate::private_state::STATE_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = fixture_root("init-slot");
+        let (service, definition) = fixture_service(InProcessBackend::new(|request| {
+            Ok(serde_json::json!({"tool": request.tool}))
+        }));
+        let discovery = load_connector_discovery("fixture").unwrap();
+
+        let refused = initialize_body("1999-01-01");
+        for _ in 0..MAX_SESSIONS + 4 {
+            let (status, session, _) = exchange_or_retry(&discovery, None, &refused, &definition);
+            assert_eq!(status, 200, "the refusal is a protocol error, not 503");
+            assert!(
+                session.is_none(),
+                "a refused initialize must not keep its slot"
+            );
+        }
+        // The table never filled: a valid handshake still mints a session.
+        let (status, session, _) = exchange_or_retry(
+            &discovery,
+            None,
+            &initialize_body(crate::application::PROTOCOL_REVISION),
+            &definition,
+        );
+        assert_eq!(status, 200);
+        assert!(session.is_some(), "a valid initialize must still mint");
+
+        drop(service);
+        crate::private_state::clear_state_root_override();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The other half of the fix: a request still executing past the idle
+    /// TTL pins its session row, so the reaper never deletes a session whose
+    /// answer is still owed.
+    #[test]
+    fn an_in_flight_call_pins_its_session_against_the_reaper() {
+        let _serial = crate::private_state::STATE_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = fixture_root("in-flight");
+        let (started, started_rx) = std::sync::mpsc::channel::<()>();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (service, definition) = fixture_service(InProcessBackend::new({
+            let release = Arc::clone(&release);
+            move |_| {
+                let _ = started.send(());
+                release.wait();
+                Ok(serde_json::json!({}))
+            }
+        }));
+        let discovery = load_connector_discovery("fixture").unwrap();
+
+        // Mint the session, then expire the TTL for anything idle.
+        let (_, session, _) = exchange_or_retry(
+            &discovery,
+            None,
+            &initialize_body(crate::application::PROTOCOL_REVISION),
+            &definition,
+        );
+        let session = session.expect("initialize mints a session");
+        service.set_session_idle_ttl(Duration::from_millis(60));
+
+        // A session-bound call that runs well past the TTL.
+        let call_body = encode_http_body(
+            &McpMessage::request(
+                2_i64,
+                "tools/call",
+                serde_json::json!({"name":"fixture_tool","arguments":{}})
+                    .as_object()
+                    .cloned(),
+            )
+            .unwrap(),
+            crate::application::MAX_MCP_FRAME_BYTES,
+        )
+        .unwrap();
+        let call = std::thread::spawn({
+            let discovery = discovery.clone();
+            let session = session.clone();
+            let definition = definition.clone();
+            move || exchange_or_retry(&discovery, Some(&session), &call_body, &definition)
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the call is in-flight");
+        thread::sleep(Duration::from_millis(100));
+
+        // The reap this admission runs must keep the pinned row: a second
+        // session-bound frame is still served, never 404.
+        let list_body = encode_http_body(
+            &McpMessage::request(3_i64, "tools/list", Some(Map::new())).unwrap(),
+            crate::application::MAX_MCP_FRAME_BYTES,
+        )
+        .unwrap();
+        let (status, _, _) = exchange_or_retry(&discovery, Some(&session), &list_body, &definition);
+        assert_eq!(status, 200, "an in-flight session must survive the reaper");
+
+        release.wait();
+        let (status, _, _) = call.join().unwrap();
+        assert_eq!(status, 200, "the pinned call completes normally");
+
+        // Released and idle again: the next table access collects the row.
+        thread::sleep(Duration::from_millis(100));
+        let (status, _, _) = exchange_or_retry(&discovery, Some(&session), &list_body, &definition);
+        assert_eq!(status, 404, "an idle unpinned session is reaped");
+
+        drop(service);
+        crate::private_state::clear_state_root_override();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

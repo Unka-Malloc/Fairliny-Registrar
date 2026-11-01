@@ -37,6 +37,21 @@ pub fn state_root_override() -> Option<PathBuf> {
         .and_then(|guard| guard.clone())
 }
 
+/// Serializes tests that install the process-global state-root override —
+/// every test touching the override must hold it or they race on the
+/// shared slot.
+#[cfg(test)]
+pub(crate) static STATE_ROOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Remove the override again: test cleanup so a later test resolves the
+/// real state root once more.
+#[cfg(test)]
+pub(crate) fn clear_state_root_override() {
+    if let Ok(mut guard) = STATE_ROOT_OVERRIDE.write() {
+        *guard = None;
+    }
+}
+
 fn resolved_state_root() -> Result<PathBuf> {
     if let Some(override_path) = state_root_override() {
         return Ok(override_path);
@@ -262,10 +277,6 @@ mod tests {
     use super::*;
     use std::env;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::sync::Mutex;
-
-    /// Serializes tests that install the process-global state-root override.
-    static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn reader_resolves_a_symlinked_state_root_like_the_writer() {
@@ -273,7 +284,9 @@ mod tests {
         // symlinked ancestor must read back the directory the writer
         // canonicalized into, not be refused by the link check on the
         // lexical path.
-        let _guard = OVERRIDE_LOCK.lock().unwrap();
+        let _guard = STATE_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let base = env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -291,9 +304,7 @@ mod tests {
         let writer = state_root().unwrap();
         let reader = state_root_read_only().unwrap();
         let expected = root.canonicalize().unwrap();
-        if let Ok(mut guard) = STATE_ROOT_OVERRIDE.write() {
-            *guard = None;
-        }
+        clear_state_root_override();
         fs::remove_dir_all(&base).unwrap();
         fs::remove_file(&link).unwrap();
 

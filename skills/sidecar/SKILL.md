@@ -46,7 +46,13 @@ mcpd connector --caller <provider>
 The caller's MCP client speaks ordinary stdio JSON-RPC to the connector.
 The connector reads the caller's bearer token from discovery, forwards
 frames to `http://127.0.0.1:<port>/mcp`, and renews the session handshake
-whenever the service publishes a new generation (e.g. after `reload`).
+whenever the service publishes a new generation (e.g. after `reload`) or
+the session was reaped for idleness — sessions idle an hour are collected,
+which is never an error: the connector replays the client's own
+`initialize` and retries the frame once, invisibly to the caller. The
+connector therefore lives as long as its caller process; idle gaps of any
+length are normal. One exception: an `effect` frame that met a dead session
+is never resent — it reports `mcp_outcome_unknown` (below).
 
 - A `--caller` absent from every registration's `callers` is refused before
   the first frame, with stderr naming the admitted set.

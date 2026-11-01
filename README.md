@@ -46,6 +46,12 @@ mcpd connector --caller <provider>                 # stdio bridge for a caller
   OS-lease liveness cleanup of stale publications.
 - Tool input schemas are closed (`additionalProperties: false`, object
   schemas only) and validated before the call reaches a backend.
+- Sessions idle for an hour are reaped — never mid-request, since an
+  in-flight call pins its session. The TTL bounds only how long a dead
+  session holds its slot: a live connector replays the client's own
+  `initialize` to mint a replacement and retries the frame once,
+  invisibly to the caller, so a connector may idle as long as its caller
+  process lives (an overnight IDE or agent session is the normal case).
 - An effect-bearing call (`effect = true`) whose transport fails mid-flight
   is reported `mcp_outcome_unknown` and is never replayed by a connector.
 - Backend children inherit the real environment plus explicit `env`
