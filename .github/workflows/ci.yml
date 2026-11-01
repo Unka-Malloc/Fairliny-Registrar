@@ -81,3 +81,9 @@ jobs:
                                "regenerate instead of editing: " + ", ".join(stale))
           print(f"release.lock provenance verified for {len(recorded)} file(s)")
           PY
+
+      # The generated helper ships its own tests beside it: table-driven
+      # coverage of the manifest rewriter and its post-check over
+      # synthetic manifests — plain python3, no cargo, no network.
+      - name: Test the generated release helper
+        run: python3 .github/test_release.py

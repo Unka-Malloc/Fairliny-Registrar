@@ -639,17 +639,45 @@ def unrecognized(path: pathlib.Path, section: str, line: str) -> TrainError:
         "set-version recognizes")
 
 
+def entries(path: pathlib.Path, section: str, rest: list[str]):
+    """The dependency-table entries inside `rest` as (text, key, sub,
+    value): `text` is the entry's whole block — a multi-line inline table
+    or array is one row — `key`/`sub` the dotted-key segments unquoted and
+    `value` the raw value text of the entry's first line. Blank lines and
+    comments yield (text, None, None, None) so callers can pass them
+    through; a line the entry grammar cannot parse fails closed — it
+    might be hiding a member pin."""
+    index = 0
+    while index < len(rest):
+        stripped = rest[index].strip()
+        text, index = gather(rest, index)
+        index += 1
+        if not stripped or stripped.startswith("#"):
+            yield text, None, None, None
+            continue
+        found = ENTRY.match(stripped)
+        if found is None:
+            raise unrecognized(path, section, text)
+        yield (text, found.group("key").strip("'\""),
+               (found.group("sub") or "").strip("'\""), found.group("value"))
+
+
 def rewrite_package(path: pathlib.Path, section: str, body: list[str],
                     next_v: str) -> tuple[list[str], int]:
-    """`[package]`/`[workspace.package]`: the member's own version field."""
+    """`[package]`/`[workspace.package]`: the member's own version field.
+    A field already at `next_v` is a no-op, not a failure — rerunning the
+    bump on a partly or fully bumped workspace must pass clean."""
     out, edited = [], 0
     for line in body:
         if re.match(r"version\s*=", line.strip()):
-            new = VERSION_FIELD.sub(f'version = "{next_v}"', line, count=1)
-            if new == line:
+            found = VERSION_FIELD.search(line)
+            if found is None:
                 raise TrainError(
                     f"{path}: [{section}] version is not a plain string")
-            line, edited = new, edited + 1
+            new = (line[:found.start()] + f'version = "{next_v}"'
+                   + line[found.end():])
+            if new != line:
+                line, edited = new, edited + 1
         out.append(line)
     return out, edited
 
@@ -663,35 +691,24 @@ def rewrite_dep_table(path: pathlib.Path, section: str, body: list[str],
     # Dotted-key renames (`foo.package = "real"`) may sit below the entries
     # they qualify — collect them before rewriting.
     renames: dict[str, str] = {}
-    index = 0
-    while index < len(rest):
-        found = ENTRY.match(rest[index].strip())
-        if found and (found.group("sub") or "").strip("'\"") == "package":
-            value = string_value(found.group("value"))
-            if value:
-                renames[found.group("key").strip("'\"")] = value
-        _, index = gather(rest, index)
-        index += 1
-    out, edited, index = [header], 0, 0
-    while index < len(rest):
-        stripped = rest[index].strip()
-        text, index = gather(rest, index)
-        index += 1
-        if not stripped or stripped.startswith("#"):
+    for _, key, sub, value in entries(path, section, rest):
+        if sub == "package":
+            renamed = string_value(value)
+            if renamed:
+                renames[key] = renamed
+    out, edited = [header], 0
+    for text, key, sub, value in entries(path, section, rest):
+        if key is None:
             out.append(text)
             continue
-        found = ENTRY.match(stripped)
-        if found is None:
-            raise unrecognized(path, section, text)
-        key = found.group("key").strip("'\"")
-        sub = (found.group("sub") or "").strip("'\"")
         if sub:
             if sub == "version" and renames.get(key, key) in members:
+                before = text
                 text, count = ASSIGN_VALUE.subn(f'\\g<1>"{next_v}"', text, count=1)
                 if not count:
                     raise TrainError(
                         f"{path}: [{section}] `{key}.version` is not a plain string")
-                edited += 1
+                edited += text != before
             out.append(text)
             continue
         if WORKSPACE_FIELD.search(text):
@@ -701,9 +718,10 @@ def rewrite_dep_table(path: pathlib.Path, section: str, body: list[str],
         if (package.group(1)[1:-1] if package else key) not in members:
             out.append(text)
             continue
+        before = text
         if VERSION_FIELD.search(text):
             text = VERSION_FIELD.sub(f'version = "{next_v}"', text, count=1)
-        elif found.group("value").lstrip().startswith(("\"", "'")):
+        elif value.lstrip().startswith(("\"", "'")):
             text = ASSIGN_VALUE.sub(f'\\g<1>"{next_v}"', text, count=1)
         elif "{" in text:
             opening = re.search(r"\{(\s*)", text)
@@ -718,7 +736,7 @@ def rewrite_dep_table(path: pathlib.Path, section: str, body: list[str],
             raise TrainError(
                 f"{path}: [{section}] member dependency `{key}` is in a form "
                 "set-version cannot rewrite")
-        edited += 1
+        edited += text != before
         out.append(text)
     return out, edited
 
@@ -732,38 +750,30 @@ def rewrite_dep_subtable(path: pathlib.Path, section: str, dep_key: str,
     matching what the flat `{ path = ... }` form gets."""
     header, rest = body[0], body[1:]
     package = None
-    for line in rest:
-        found = ENTRY.match(line.strip())
-        if found and found.group("key").strip("'\"") == "package" \
-                and not found.group("sub"):
-            package = string_value(found.group("value"))
+    for _, key, sub, value in entries(path, section, rest):
+        if key == "package" and not sub:
+            package = string_value(value)
     if (package or dep_key) not in members:
         return body, 0
-    out, edited, inherited, index = [header], 0, False, 0
-    while index < len(rest):
-        stripped = rest[index].strip()
-        text, index = gather(rest, index)
-        index += 1
-        if not stripped or stripped.startswith("#"):
+    out, edited, pinned, inherited = [header], 0, False, False
+    for text, key, sub, value in entries(path, section, rest):
+        if key is None:
             out.append(text)
             continue
-        found = ENTRY.match(stripped)
-        if found is None:
-            raise unrecognized(path, section, text)
-        key = found.group("key").strip("'\"")
-        sub = (found.group("sub") or "").strip("'\"")
         if key == "version" and not sub:
+            before = text
             text, count = ASSIGN_VALUE.subn(f'\\g<1>"{next_v}"', text, count=1)
             if not count:
                 raise TrainError(
                     f"{path}: [{section}] member `{dep_key}` pins a version "
                     "set-version cannot rewrite")
-            edited += 1
-        elif key == "version" and sub == "workspace" \
-                or key == "workspace" and WORKSPACE_FIELD.search(text):
+            pinned = True
+            edited += text != before
+        elif (key == "version" and sub == "workspace") \
+                or (key == "workspace" and WORKSPACE_FIELD.search(text)):
             inherited = True
         out.append(text)
-    if not edited and not inherited:
+    if not pinned and not inherited:
         out.insert(1, f'version = "{next_v}"\n')
         edited += 1
     return out, edited

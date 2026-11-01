@@ -15,7 +15,11 @@
 # reviewers and a deployment-branch rule allowing only the default
 # branch, and bind crates.io Trusted Publishing to that environment —
 # the environment, not the in-file ref check below (kept as a second
-# lock), is what confines a dispatch's reach. To release manually,
+# lock), is what confines a dispatch's reach. That shape is an operator
+# prerequisite: the gate asserts it on release-bound runs where the
+# environment is readable, but a workflow token has no Administration
+# scope, so the check can prove a missing environment (404) yet only
+# warn on settings it cannot see. To release manually,
 # dispatch `verify.yml` on the default branch instead; a live
 # (non-rehearsal) run flows into this pipeline and still meets the
 # approval gate.
@@ -62,60 +66,6 @@ jobs:
     env:
       RUN_ID: ${{ github.event.workflow_run.id }}
     steps:
-      # A missing `release` environment is worse than a misconfigured one:
-      # GitHub silently creates an unprotected environment the moment the
-      # release job starts, which retires the approval gate with no signal
-      # anywhere. Assert its real shape first — required reviewers plus a
-      # deployment-branch rule the default branch satisfies — so a broken
-      # gate fails closed and a rehearsal surfaces it long before a live
-      # release depends on it.
-      - name: Preflight the release environment
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          guide='required reviewers plus a deployment-branch rule limited to the default branch — create it under Settings → Environments → release, then bind crates.io Trusted Publishing to it'
-          if ! gh api "repos/$GITHUB_REPOSITORY/environments/release" > environment.json 2>environment.err; then
-            echo "::error::this repository has no \`release\` environment — GitHub would create an unprotected one when the release job starts, silently removing the approval gate: $guide"
-            cat environment.err
-            exit 1
-          fi
-          gh api "repos/$GITHUB_REPOSITORY/environments/release/deployment-branch-policies" > policies.json
-          gh api "repos/$GITHUB_REPOSITORY/branches/$DEFAULT_BRANCH" > branch.json
-          python3 - <<'PY'
-          import fnmatch, json, os, sys
-
-          GUIDE = ("required reviewers plus a deployment-branch rule limited to the "
-                   "default branch — fix it under Settings → Environments → release")
-
-          def stop(message):
-              print(f"::error::{message} — {GUIDE}")
-              sys.exit(1)
-
-          env = json.load(open("environment.json"))
-          rules = env.get("protection_rules") or []
-          if not any(rule.get("type") == "required_reviewers" and rule.get("reviewers")
-                     for rule in rules):
-              stop("the `release` environment has no required reviewers")
-          policy = env.get("deployment_branch_policy") or {}
-          default = os.environ["DEFAULT_BRANCH"]
-          if not policy.get("protected_branches") \
-                  and not policy.get("custom_branch_policies"):
-              stop("the `release` environment lets every branch deploy")
-          if policy.get("protected_branches") \
-                  and not json.load(open("branch.json")).get("protected"):
-              stop(f"only protected branches may deploy to `release`, "
-                   f"but `{default}` is not a protected branch")
-          if policy.get("custom_branch_policies"):
-              names = [p["name"] for p in
-                       json.load(open("policies.json")).get("branch_policies", [])]
-              if not any(fnmatch.fnmatchcase(default, name) for name in names):
-                  stop(f"no `release` deployment-branch rule lets the default branch "
-                       f"`{default}` deploy (rules: {', '.join(names) or 'none'})")
-          print("release environment: required reviewers and a bounded "
-                "deployment-branch rule are in place")
-          PY
-
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           name: release-inputs
@@ -308,6 +258,117 @@ jobs:
             exit 1
           fi
           echo "source is $default; candidate is $status of the run head"
+
+      # Runs only when the bound run is a live release heading for the
+      # OIDC job — a rehearsal or a clean skip never gets that far, so
+      # there is nothing to preflight and the credential-free gate must
+      # not die on this endpoint's permission wall. The default token
+      # cannot read environment protection rules (a workflow token has
+      # no Administration scope), so the status decides: only a 404
+      # proves the environment missing — the catastrophic case, since
+      # GitHub would create an unprotected one the moment the release
+      # job starts and the approval gate vanishes with no signal — and
+      # it still fails closed. A readable environment gets its full
+      # shape asserted; an unreadable one warns, because the real
+      # enforcement is server-side at job entry and the declared shape
+      # is the operator prerequisite this file's header lays out. The
+      # anonymous retry reads the same resource a public repository
+      # exposes without credentials — the only way a missing
+      # environment is still detectable behind the permission wall.
+      - name: Preflight the release environment
+        if: steps.bind.outputs.mode == 'live' && steps.load.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 - <<'PY'
+          import fnmatch, json, os, sys, urllib.error, urllib.request
+
+          GUIDE = ("required reviewers plus a deployment-branch rule limited to the "
+                   "default branch — create it under Settings → Environments → "
+                   "release, then bind crates.io Trusted Publishing to it")
+
+          def stop(message):
+              print(f"::error::{message} — {GUIDE}")
+              sys.exit(1)
+
+          def warn(message):
+              print(f"::warning::{message}")
+              sys.exit(0)
+
+          def get(path, tokened=True):
+              headers = {"Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28"}
+              if tokened:
+                  headers["Authorization"] = f"Bearer {os.environ['GH_TOKEN']}"
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/"
+                  f"{os.environ['GITHUB_REPOSITORY']}{path}", headers=headers)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return response.status, json.loads(response.read().decode())
+              except urllib.error.HTTPError as error:
+                  return error.code, None
+              except urllib.error.URLError:
+                  return 0, None
+
+          default = os.environ["DEFAULT_BRANCH"]
+          tokened = True
+          status, env = get("/environments/release")
+          if status in (401, 403):
+              # This token cannot read environment settings. A public
+              # repository exposes the same resource without credentials —
+              # the anonymous read is what still distinguishes "missing"
+              # from "exists but unreadable"; anything inconclusive is
+              # treated as unreadable, never as absent.
+              tokened = False
+              status, env = get("/environments/release", tokened=False)
+              if status == 404:
+                  repo_status, _ = get("", tokened=False)
+                  if repo_status != 200:
+                      status = 403
+          if status == 404:
+              stop("this repository has no `release` environment — GitHub would "
+                   "create an unprotected one when the release job starts, "
+                   "silently removing the approval gate")
+          if status in (401, 403):
+              warn(f"cannot read the `release` environment's settings with this "
+                   f"token (HTTP {status}); the environment's own protection "
+                   f"still applies at job entry — confirm it carries {GUIDE}")
+          if status != 200:
+              warn(f"could not read the `release` environment (HTTP {status}); "
+                   "the release job still meets the environment's own protection")
+          rules = env.get("protection_rules") or []
+          if not any(rule.get("type") == "required_reviewers" and rule.get("reviewers")
+                     for rule in rules):
+              stop("the `release` environment has no required reviewers")
+          policy = env.get("deployment_branch_policy") or {}
+          if not policy.get("protected_branches") \
+                  and not policy.get("custom_branch_policies"):
+              stop("the `release` environment lets every branch deploy")
+          if policy.get("protected_branches"):
+              code, branch = get(f"/branches/{default}", tokened=tokened)
+              if code != 200:
+                  print(f"::warning::cannot read `{default}` branch protection "
+                        f"(HTTP {code}) — skipping that facet")
+              elif not branch.get("protected"):
+                  stop(f"only protected branches may deploy to `release`, "
+                       f"but `{default}` is not a protected branch")
+          if policy.get("custom_branch_policies"):
+              code, policies = get("/environments/release/deployment-branch-policies",
+                                   tokened=tokened)
+              if code != 200:
+                  print(f"::warning::cannot read `release` deployment-branch rules "
+                        f"(HTTP {code}) — skipping that facet")
+              else:
+                  names = [p["name"] for p in policies.get("branch_policies", [])]
+                  if not any(fnmatch.fnmatchcase(default, name) for name in names):
+                      stop(f"no `release` deployment-branch rule lets the default "
+                           f"branch `{default}` deploy "
+                           f"(rules: {', '.join(names) or 'none'})")
+          print("release environment: required reviewers and a bounded "
+                "deployment-branch rule are in place")
+          PY
 
   release:
     # Only a completed verify workflow_run reaches this job — there is no
