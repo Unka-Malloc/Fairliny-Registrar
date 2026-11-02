@@ -1,4 +1,4 @@
-# MCP-Dispatcher
+# Fairliny-Registrar
 
 A generic, registration-based MCP service dispatcher. Any host registers
 named tool services — an ordered catalog of closed input schemas plus a
@@ -8,14 +8,14 @@ callers behind per-caller ephemeral bearer tokens.
 
 The machinery is the service-neutral core extracted from LicoUp's
 `licoup-public-gateway`, generalized so the dispatcher carries no host or
-agent semantics of its own. `mcpd` is the standalone binary that serves
+agent semantics of its own. `flr` is the standalone binary that serves
 declaratively-registered services from a TOML file.
 
 ```text
-mcpd serve --config services.toml [--home <dir>]   # foreground
-mcpd service start --config services.toml          # detached
-mcpd service status|stop|reload
-mcpd connector --caller <provider>                 # stdio bridge for a caller
+flr serve --config services.toml [--home <dir>]   # foreground
+flr service start --config services.toml          # detached
+flr service status|stop|reload
+flr connector --caller <provider>                 # stdio bridge for a caller
 ```
 
 ## The model
@@ -41,7 +41,7 @@ mcpd connector --caller <provider>                 # stdio bridge for a caller
 - HTTP binds numeric loopback only (`127.0.0.1`, random port); exact `Host`
   check, `Origin` must be absent, bounded headers/connections/sessions.
 - Bearer tokens are per-caller, per-generation, never logged.
-- Discovery lives under the state root (`--home`, `MCPD_HOME`, else the
+- Discovery lives under the state root (`--home`, `FLR_HOME`, else the
   platform user-data dir) with owner-only permissions, atomic writes and
   OS-lease liveness cleanup of stale publications.
 - Tool input schemas are closed (`additionalProperties: false`, object
@@ -72,7 +72,7 @@ src/windows_private_state.rs  Windows ACL policy (cfg-gated)
 src/lifecycle.rs       serve/service start|stop|status|reload, OS lease
 src/connector.rs       stdio→HTTP caller bridge
 src/config.rs          services.toml composition root
-src/bin/mcpd.rs        the binary
+src/bin/flr.rs        the binary
 src/bin/stub_backend.rs  synthetic framed-protocol fixture for tests
 presets/               declarative service files (incl. licoup-subagents)
 docs/integration-modes.md

@@ -1,4 +1,4 @@
-# LicoUp subagent-mesh preset for `mcpd serve`.
+# LicoUp subagent-mesh preset for `flr serve`.
 #
 # This is LicoUp's admitted remote surface as a declarative registration: the
 # five subagent tools routed to `licoup subagents execute --stdin-json` over
@@ -8,11 +8,11 @@
 #
 # Run it beside a LicoUp data root:
 #
-#   LICOUP_HOME=<licoup data root> MCPD_HOME=<any state root> \
-#       mcpd service start --config presets/licoup-subagents.toml
+#   LICOUP_HOME=<licoup data root> FLR_HOME=<any state root> \
+#       flr service start --config presets/licoup-subagents.toml
 #
-# Point an admitted caller at it with `mcpd connector --caller <provider>`
-# bound to the same MCPD_HOME. LICOUP_HOME must also be visible to the
+# Point an admitted caller at it with `flr connector --caller <provider>`
+# bound to the same FLR_HOME. LICOUP_HOME must also be visible to the
 # backend so `licoup rpc stdio` resolves its own home — child sessions
 # inherit the real environment, per the environment-fidelity rule.
 #

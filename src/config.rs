@@ -1,4 +1,4 @@
-//! Declarative registrations: `mcpd serve --config services.toml`.
+//! Declarative registrations: `flr serve --config services.toml`.
 //!
 //! The file describes the same things a host embedding the crate builds in
 //! Rust: per-`[[service]]` name, optional version, caller allowlist,
@@ -88,19 +88,19 @@ struct ServicesFile {
 }
 
 /// Load the registration file and build the dispatcher plus the serving
-/// identity. This is the `mcpd` composition root; embedding hosts build the
+/// identity. This is the `flr` composition root; embedding hosts build the
 /// same `(Dispatcher, McpServerDefinition, Vec<ContextField>)` tuple in Rust
 /// and never touch the file.
 pub fn load_dispatcher(
     path: &Path,
 ) -> Result<(Dispatcher, McpServerDefinition, Vec<ContextField>)> {
-    let text = fs::read_to_string(path).map_err(|_| anyhow!("mcpd_config_unavailable"))?;
-    let file: ServicesFile = toml::from_str(&text).map_err(|_| anyhow!("mcpd_config_invalid"))?;
+    let text = fs::read_to_string(path).map_err(|_| anyhow!("flr_config_unavailable"))?;
+    let file: ServicesFile = toml::from_str(&text).map_err(|_| anyhow!("flr_config_invalid"))?;
     build(&file)
 }
 
 fn build(file: &ServicesFile) -> Result<(Dispatcher, McpServerDefinition, Vec<ContextField>)> {
-    ensure!(!file.service.is_empty(), "mcpd_config_services_empty");
+    ensure!(!file.service.is_empty(), "flr_config_services_empty");
     let mut attributes = BTreeSet::new();
     let mut headers = BTreeSet::new();
     let mut envs = BTreeSet::new();
@@ -110,7 +110,7 @@ fn build(file: &ServicesFile) -> Result<(Dispatcher, McpServerDefinition, Vec<Co
             attributes.insert(&field.attribute)
                 && headers.insert(&field.header)
                 && envs.insert(&field.env),
-            "mcpd_context_field_duplicate"
+            "flr_context_field_duplicate"
         );
     }
 
@@ -125,7 +125,7 @@ fn build(file: &ServicesFile) -> Result<(Dispatcher, McpServerDefinition, Vec<Co
             .collect();
         ensure!(
             control.iter().all(|name| declared.contains(name)),
-            "mcpd_control_tool_undeclared"
+            "flr_control_tool_undeclared"
         );
         let mut tools = Vec::with_capacity(service.tools.len());
         for tool in &service.tools {
@@ -154,7 +154,7 @@ fn build(file: &ServicesFile) -> Result<(Dispatcher, McpServerDefinition, Vec<Co
         .server
         .as_ref()
         .and_then(|server| server.name.clone())
-        .unwrap_or_else(|| "mcpd".to_owned());
+        .unwrap_or_else(|| "flr".to_owned());
     let version = file
         .server
         .as_ref()
@@ -162,7 +162,7 @@ fn build(file: &ServicesFile) -> Result<(Dispatcher, McpServerDefinition, Vec<Co
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
     ensure!(
         !name.is_empty() && !version.is_empty(),
-        "mcpd_server_identity_invalid"
+        "flr_server_identity_invalid"
     );
     let definition = McpServerDefinition {
         protocol_revision: PROTOCOL_REVISION,
@@ -196,9 +196,9 @@ impl ToolTable {
         match (&self.input_schema, &self.input_schema_json) {
             (Some(schema), None) => toml_to_json(schema),
             (None, Some(text)) => {
-                serde_json::from_str(text).map_err(|_| anyhow!("mcpd_tool_schema_invalid"))
+                serde_json::from_str(text).map_err(|_| anyhow!("flr_tool_schema_invalid"))
             }
-            _ => Err(anyhow!("mcpd_tool_schema_invalid")),
+            _ => Err(anyhow!("flr_tool_schema_invalid")),
         }
     }
 }
@@ -211,7 +211,7 @@ fn toml_to_json(value: &toml::Value) -> Result<Value> {
         toml::Value::Integer(number) => Value::Number((*number).into()),
         toml::Value::Float(number) => Value::Number(
             serde_json::Number::from_f64(*number)
-                .ok_or_else(|| anyhow!("mcpd_tool_schema_invalid"))?,
+                .ok_or_else(|| anyhow!("flr_tool_schema_invalid"))?,
         ),
         toml::Value::Boolean(flag) => Value::Bool(*flag),
         toml::Value::Datetime(moment) => Value::String(moment.to_string()),
@@ -251,7 +251,7 @@ callers = ["codex"]
 [service.backend]
 program = "backend-bin"
 args = ["serve"]
-protocol = "mcpd.stdio.v1"
+protocol = "flr.stdio.v1"
 invoke = ["call", "{request}"]
 [[service.tools]]
 name = "alpha_tool"
@@ -261,7 +261,7 @@ input_schema = {type = "object", additionalProperties = false, properties = {}, 
         let (dispatcher, definition, context) = build(&file).unwrap();
         assert_eq!(dispatcher.caller_providers(), vec!["codex"]);
         assert_eq!(dispatcher.catalog_names(), vec!["alpha_tool"]);
-        assert_eq!(definition.server_name, "mcpd");
+        assert_eq!(definition.server_name, "flr");
         assert_eq!(definition.protocol_revision, "2025-06-18");
         assert!(context.is_empty());
     }
@@ -274,7 +274,7 @@ name = "alpha"
 callers = ["codex"]
 [service.backend]
 program = "a"
-protocol = "mcpd.stdio.v1"
+protocol = "flr.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "shared"
@@ -284,7 +284,7 @@ name = "beta"
 callers = ["cursor"]
 [service.backend]
 program = "b"
-protocol = "mcpd.stdio.v1"
+protocol = "flr.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "shared"
@@ -294,7 +294,7 @@ input_schema_json = "{\"type\":\"object\",\"additionalProperties\":false,\"prope
         let error = build(&file)
             .map(|_| ())
             .expect_err("colliding catalogs cannot serve");
-        assert_eq!(error.to_string(), "mcpd_tool_name_collision");
+        assert_eq!(error.to_string(), "flr_tool_name_collision");
     }
 
     #[test]
@@ -307,7 +307,7 @@ callers = ["codex"]
 control = ["not_a_tool"]
 [service.backend]
 program = "a"
-protocol = "mcpd.stdio.v1"
+protocol = "flr.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "real_tool"
@@ -317,7 +317,7 @@ input_schema_json = "{\"type\":\"object\",\"additionalProperties\":false,\"prope
         let error = build(&file)
             .map(|_| ())
             .expect_err("an undeclared control tool is a config defect");
-        assert_eq!(error.to_string(), "mcpd_control_tool_undeclared");
+        assert_eq!(error.to_string(), "flr_control_tool_undeclared");
     }
 
     #[test]
@@ -354,7 +354,7 @@ name = "alpha"
 callers = ["codex"]
 [service.backend]
 program = "a"
-protocol = "mcpd.stdio.v1"
+protocol = "flr.stdio.v1"
 invoke = ["{request}"]
 [[service.tools]]
 name = "t"
@@ -364,7 +364,7 @@ input_schema_json = "{\"type\":\"object\",\"additionalProperties\":false,\"prope
         let error = build(&file)
             .map(|_| ())
             .expect_err("aliased attributes are ambiguous");
-        assert_eq!(error.to_string(), "mcpd_context_field_duplicate");
+        assert_eq!(error.to_string(), "flr_context_field_duplicate");
     }
 
     #[test]

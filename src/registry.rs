@@ -106,7 +106,7 @@ impl ContextField {
             valid_context_attribute(&self.attribute)
                 && valid_context_header_name(&self.header)
                 && valid_context_env_name(&self.env),
-            "mcpd_context_field_invalid"
+            "flr_context_field_invalid"
         );
         Ok(())
     }
@@ -150,7 +150,7 @@ pub struct ToolRequest<'a> {
 /// The handler backend one registration owns. `NativeBackend` bridges a
 /// pooled child process; `InProcessBackend` is the embedding host's own
 /// handler. `Ok` payloads become the tool result verbatim; `Err` becomes the
-/// structured `mcpd.error.v1` payload — a backend never invents the transport
+/// structured `flr.error.v1` payload — a backend never invents the transport
 /// error shape itself.
 pub trait ToolHandler: Send + Sync {
     fn call(&self, request: &ToolRequest<'_>) -> std::result::Result<Value, McpApplicationError>;
@@ -179,14 +179,14 @@ impl ToolSpec {
         let name = catalog_entry
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("mcpd_tool_spec_invalid"))?;
-        ensure!(valid_tool_name(name), "mcpd_tool_spec_invalid");
+            .ok_or_else(|| anyhow!("flr_tool_spec_invalid"))?;
+        ensure!(valid_tool_name(name), "flr_tool_spec_invalid");
         let input_schema = catalog_entry
             .get("inputSchema")
             .filter(|schema| schema.is_object())
             .cloned()
-            .ok_or_else(|| anyhow!("mcpd_tool_spec_invalid"))?;
-        ensure!(closed_input_schema(&input_schema), "mcpd_tool_spec_invalid");
+            .ok_or_else(|| anyhow!("flr_tool_spec_invalid"))?;
+        ensure!(closed_input_schema(&input_schema), "flr_tool_spec_invalid");
         Ok(Self {
             name: name.to_owned(),
             catalog_entry,
@@ -251,18 +251,18 @@ impl Registration {
         let version = version.into();
         ensure!(
             !name.is_empty() && !version.is_empty(),
-            "mcpd_service_invalid"
+            "flr_service_invalid"
         );
-        ensure!(!tools.is_empty(), "mcpd_service_tools_empty");
+        ensure!(!tools.is_empty(), "flr_service_tools_empty");
         let mut seen = BTreeSet::new();
         ensure!(
             tools.iter().all(|tool| seen.insert(tool.name())),
-            "mcpd_tool_name_collision"
+            "flr_tool_name_collision"
         );
-        ensure!(!callers.is_empty(), "mcpd_service_callers_empty");
+        ensure!(!callers.is_empty(), "flr_service_callers_empty");
         ensure!(
             callers.iter().all(|caller| valid_caller_id(caller)),
-            "mcpd_caller_invalid"
+            "flr_caller_invalid"
         );
         Ok(Self {
             name,
@@ -309,7 +309,7 @@ impl Registry {
     /// set fails startup — a collision is a configuration defect, never a
     /// first-come-wins merge.
     pub fn new(registrations: Vec<Registration>) -> Result<Self> {
-        ensure!(!registrations.is_empty(), "mcpd_registry_empty");
+        ensure!(!registrations.is_empty(), "flr_registry_empty");
         let mut catalog = Vec::new();
         let mut routes = HashMap::new();
         let mut callers = BTreeSet::new();
@@ -325,7 +325,7 @@ impl Registry {
                     routes
                         .insert(spec.name().to_owned(), (service, tool))
                         .is_none(),
-                    "mcpd_tool_name_collision"
+                    "flr_tool_name_collision"
                 );
                 if spec.effect {
                     effect_tools.insert(spec.name().to_owned());
@@ -577,7 +577,7 @@ mod tests {
         let error = Registry::new(vec![first, second])
             .map(|_| ())
             .expect_err("the same tool name must never merge silently");
-        assert_eq!(error.to_string(), "mcpd_tool_name_collision");
+        assert_eq!(error.to_string(), "flr_tool_name_collision");
     }
 
     #[test]
@@ -586,7 +586,7 @@ mod tests {
         let error = Registration::new("alpha", "1", tools, vec!["a".to_owned()], Echo)
             .map(|_| ())
             .expect_err("a service may not shadow itself");
-        assert_eq!(error.to_string(), "mcpd_tool_name_collision");
+        assert_eq!(error.to_string(), "flr_tool_name_collision");
     }
 
     #[test]

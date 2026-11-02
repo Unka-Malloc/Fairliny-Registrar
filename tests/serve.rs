@@ -1,7 +1,7 @@
 //! Process contract proof over a synthetic framed-protocol backend.
 //!
-//! The subject is the real `mcpd` binary serving declaratively-registered
-//! services; every backend session is the deterministic `mcpd-stub-backend`
+//! The subject is the real `flr` binary serving declaratively-registered
+//! services; every backend session is the deterministic `flr-stub-backend`
 //! fixture — an echo responder with no tools, no network and no agent. The
 //! proofs cover the union catalog, per-registration caller admission, the
 //! reserved control channel, connector reload behaviour and lifecycle
@@ -20,8 +20,8 @@ use std::{
     time::Duration,
 };
 
-const MCPD: &str = env!("CARGO_BIN_EXE_mcpd");
-const STUB: &str = env!("CARGO_BIN_EXE_mcpd-stub-backend");
+const FLR: &str = env!("CARGO_BIN_EXE_flr");
+const STUB: &str = env!("CARGO_BIN_EXE_flr-stub-backend");
 
 struct Fixture {
     root: PathBuf,
@@ -39,7 +39,7 @@ callers = [{callers}]
 [service.backend]
 program = "{STUB}"
 args = []
-protocol = "mcpd.stdio.v1"
+protocol = "flr.stdio.v1"
 invoke = ["echo", "{{request}}"]
 {tools}
 "#
@@ -66,7 +66,7 @@ impl Fixture {
     }
 
     fn with_config(config: Option<String>) -> Self {
-        let root = std::env::temp_dir().join(format!("mcpd-contract-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("flr-contract-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         // Canonicalize so macOS /var→/private/var symlinks never confuse the
         // link-rejecting custody checks.
@@ -113,11 +113,11 @@ env = "FIXTURE_CONVERSATION"
     }
 
     fn service(&self, args: &[&str]) -> std::process::Output {
-        Command::new(MCPD)
+        Command::new(FLR)
             .args(args)
-            .env("MCPD_HOME", &self.home)
-            .env("MCPD_STUB_DIR", &self.stub_dir)
-            .env("MCPD_STUB_MARKER", "env-alive")
+            .env("FLR_HOME", &self.home)
+            .env("FLR_STUB_DIR", &self.stub_dir)
+            .env("FLR_STUB_MARKER", "env-alive")
             .output()
             .unwrap()
     }
@@ -137,9 +137,9 @@ env = "FIXTURE_CONVERSATION"
     }
 
     fn connector(&self, caller: &str) -> Child {
-        Command::new(MCPD)
+        Command::new(FLR)
             .args(["connector", "--caller", caller])
-            .env("MCPD_HOME", &self.home)
+            .env("FLR_HOME", &self.home)
             .env("FIXTURE_CONVERSATION", "conversation:one")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -151,9 +151,9 @@ env = "FIXTURE_CONVERSATION"
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = Command::new(MCPD)
+        let _ = Command::new(FLR)
             .args(["service", "stop"])
-            .env("MCPD_HOME", &self.home)
+            .env("FLR_HOME", &self.home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -436,10 +436,10 @@ fn reload_renews_an_existing_connector_session() {
 #[test]
 fn stale_discovery_after_an_owned_service_crash_marks_outcomes_and_stops() {
     let fixture = Fixture::new();
-    let mut service = Command::new(MCPD)
+    let mut service = Command::new(FLR)
         .args(["serve", "--config", fixture.config.to_str().unwrap()])
-        .env("MCPD_HOME", &fixture.home)
-        .env("MCPD_STUB_DIR", &fixture.stub_dir)
+        .env("FLR_HOME", &fixture.home)
+        .env("FLR_STUB_DIR", &fixture.stub_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -509,7 +509,7 @@ fn a_colliding_catalog_refuses_to_serve() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("mcpd_tool_name_collision"),
+        stderr.contains("flr_tool_name_collision"),
         "unexpected refusal: {stderr}"
     );
 }
@@ -518,9 +518,9 @@ fn a_colliding_catalog_refuses_to_serve() {
 fn an_unadmitted_caller_is_refused_before_any_frame() {
     let fixture = Fixture::new();
     assert_eq!(fixture.lifecycle("start")["state"], "running");
-    let output = Command::new(MCPD)
+    let output = Command::new(FLR)
         .args(["connector", "--caller", "outsider"])
-        .env("MCPD_HOME", &fixture.home)
+        .env("FLR_HOME", &fixture.home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

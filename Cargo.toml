@@ -1,27 +1,27 @@
 [package]
-name = "mcp-dispatcher"
+name = "fairliny-registrar"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/Unka-Malloc/MCP-Dispatcher"
+repository = "https://github.com/Unka-Malloc/Fairliny-Registrar"
 description = "Registration-based MCP service dispatcher: hosts declare tool services once, callers reach them over authenticated MCP on stdio and loopback HTTP."
 keywords = ["mcp", "json-rpc", "dispatcher", "agent", "loopback"]
 categories = ["network-programming", "api-bindings"]
 
 [lib]
-name = "mcp_dispatcher"
+name = "fairliny_registrar"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mcpd"
-path = "src/bin/mcpd.rs"
+name = "flr"
+path = "src/bin/flr.rs"
 
 # Test/support fixture only: a loopback-free child backend that echoes the
-# framed request it receives. Integration proofs drive `mcpd` against it; it
+# framed request it receives. Integration proofs drive `flr` against it; it
 # performs no work of its own.
 [[bin]]
-name = "mcpd-stub-backend"
+name = "flr-stub-backend"
 path = "src/bin/stub_backend.rs"
 
 [workspace]

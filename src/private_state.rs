@@ -2,7 +2,7 @@
 //!
 //! The state root resolves once per process: an explicit override installed by
 //! the embedding host (`--home` / [`set_state_root_override`]), then the
-//! `MCPD_HOME` environment variable, then the platform user-data directory.
+//! `FLR_HOME` environment variable, then the platform user-data directory.
 //! All custody primitives — owner-only directories, link rejection, bounded
 //! reads, atomic publishes — are the lifted contract unchanged.
 
@@ -16,7 +16,7 @@ use std::{
 
 /// The environment variable naming the state root when no explicit override
 /// is installed.
-pub const STATE_ROOT_ENV: &str = "MCPD_HOME";
+pub const STATE_ROOT_ENV: &str = "FLR_HOME";
 
 static STATE_ROOT_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 
@@ -67,7 +67,7 @@ fn resolved_state_root() -> Result<PathBuf> {
 }
 
 /// The platform user-data directory for the dispatcher when neither an
-/// override nor `MCPD_HOME` names one.
+/// override nor `FLR_HOME` names one.
 fn platform_default_state_root() -> Result<PathBuf> {
     platform_default_root().ok_or_else(|| anyhow!("mcp_state_unavailable"))
 }
@@ -78,7 +78,7 @@ fn platform_default_root() -> Option<PathBuf> {
         PathBuf::from(home)
             .join("Library")
             .join("Application Support")
-            .join("mcpd")
+            .join("flr")
     })
 }
 
@@ -88,7 +88,7 @@ fn platform_default_root() -> Option<PathBuf> {
         .iter()
         .copied()
         .find_map(env::var_os)
-        .map(|root| PathBuf::from(root).join("mcpd"))
+        .map(|root| PathBuf::from(root).join("flr"))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -96,15 +96,10 @@ fn platform_default_root() -> Option<PathBuf> {
     if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
         let xdg = PathBuf::from(xdg);
         if xdg.is_absolute() {
-            return Some(xdg.join("mcpd"));
+            return Some(xdg.join("flr"));
         }
     }
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("mcpd")
-    })
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share").join("flr"))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]

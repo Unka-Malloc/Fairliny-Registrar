@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 /// The invoke-argv element replaced by the serialized call envelope.
 pub const REQUEST_PLACEHOLDER: &str = "{request}";
 
-const DEFAULT_WORKFLOW_ID: &str = "mcpd-service";
+const DEFAULT_WORKFLOW_ID: &str = "flr-service";
 const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// The grace a dropped session gives its child to notice stdin EOF and exit
@@ -109,7 +109,7 @@ impl NativeSpec {
                 && !self.invoke.is_empty()
                 && self.invoke.iter().any(|arg| arg == REQUEST_PLACEHOLDER)
                 && self.max_frame_bytes > 0,
-            "mcpd_native_spec_invalid"
+            "flr_native_spec_invalid"
         );
         Ok(())
     }
@@ -140,15 +140,15 @@ impl ChildSession {
         }
         let mut child = command
             .spawn()
-            .map_err(|_| anyhow!("mcpd_backend_unavailable"))?;
+            .map_err(|_| anyhow!("flr_backend_unavailable"))?;
         let input = child
             .stdin
             .take()
-            .ok_or_else(|| anyhow!("mcpd_backend_unavailable"))?;
+            .ok_or_else(|| anyhow!("flr_backend_unavailable"))?;
         let output = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow!("mcpd_backend_unavailable"))?;
+            .ok_or_else(|| anyhow!("flr_backend_unavailable"))?;
         Ok(Self {
             child,
             input: Some(input),
@@ -419,13 +419,13 @@ mod tests {
         let spec = NativeSpec::new(
             "prog",
             vec!["arg".into()],
-            "mcpd.stdio.v1",
+            "flr.stdio.v1",
             vec!["no-placeholder".into()],
         );
         assert!(spec.is_err());
-        let spec = NativeSpec::new("prog", vec![], "mcpd.stdio.v1", vec!["{request}".into()]);
+        let spec = NativeSpec::new("prog", vec![], "flr.stdio.v1", vec!["{request}".into()]);
         assert!(spec.is_ok());
-        let spec = NativeSpec::new("", vec![], "mcpd.stdio.v1", vec!["{request}".into()]);
+        let spec = NativeSpec::new("", vec![], "flr.stdio.v1", vec!["{request}".into()]);
         assert!(spec.is_err());
     }
 }

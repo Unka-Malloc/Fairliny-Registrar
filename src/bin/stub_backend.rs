@@ -1,4 +1,4 @@
-//! `mcpd-stub-backend` — a deterministic framed-protocol fixture.
+//! `flr-stub-backend` — a deterministic framed-protocol fixture.
 //!
 //! A test/support binary, not a service: it speaks the same line-framed
 //! protocol `NativeBackend` drives — one JSON request per stdin line, one
@@ -7,7 +7,7 @@
 //! network and performs no work of its own.
 //!
 //! Fixture vocabulary for integration proofs (all synthetic):
-//! * request `"name": "fixture_hold"` — when `$MCPD_STUB_DIR/hold` exists,
+//! * request `"name": "fixture_hold"` — when `$FLR_STUB_DIR/hold` exists,
 //!   writes `hold-started` and answers only once `released` appears, so a
 //!   proof can hold an ordinary call open;
 //! * request `"name": "fixture_cancel"` — writes `released`, ending the
@@ -15,7 +15,7 @@
 //! * request `"name": "fixture_drop"` — the child exits immediately without
 //!   replying, so the parent sees EOF mid-call (a post-write transport
 //!   failure whose outcome is unknown);
-//! * every reply echoes `marker` = `$MCPD_STUB_MARKER`, proving the child
+//! * every reply echoes `marker` = `$FLR_STUB_MARKER`, proving the child
 //!   inherited the real environment rather than an empty one.
 
 use serde_json::{Value, json};
@@ -36,7 +36,7 @@ fn request_envelope(args: &[Value]) -> Option<Value> {
 }
 
 fn work_dir() -> Option<PathBuf> {
-    env::var_os("MCPD_STUB_DIR").map(PathBuf::from)
+    env::var_os("FLR_STUB_DIR").map(PathBuf::from)
 }
 
 fn wait_for_release() {
@@ -79,7 +79,7 @@ fn execute(request: &Value) -> Value {
     json!({
         "args": args,
         "request": envelope.unwrap_or(Value::Null),
-        "marker": env::var("MCPD_STUB_MARKER").unwrap_or_default(),
+        "marker": env::var("FLR_STUB_MARKER").unwrap_or_default(),
     })
 }
 
@@ -102,7 +102,7 @@ fn main() -> ExitCode {
                 "result": execute(&request),
             }),
             Err(_) => json!({
-                "protocol": "mcpd.stdio.v1",
+                "protocol": "flr.stdio.v1",
                 "id": Value::Null,
                 "workflowId": Value::Null,
                 "ok": false,

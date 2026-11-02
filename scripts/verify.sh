@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Required verification entry for MCP-Dispatcher.
+# Required verification entry for Fairliny-Registrar.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

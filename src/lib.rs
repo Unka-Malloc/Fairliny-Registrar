@@ -1,4 +1,4 @@
-//! MCP-Dispatcher: the registration-based MCP service dispatcher.
+//! Fairliny-Registrar: the registration-based MCP service dispatcher.
 //!
 //! The crate is three layers over one engine:
 //!
@@ -18,7 +18,7 @@
 //!   the thin stdio connector bridging a caller process to that service, the
 //!   local service lifecycle and the credential custody primitives.
 //!
-//! `config` is the `mcpd serve --config services.toml` composition root; the
+//! `config` is the `flr serve --config services.toml` composition root; the
 //! same tuple is built in Rust by embedding hosts.
 
 pub mod application;

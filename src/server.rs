@@ -350,7 +350,7 @@ where
             }
             Err(error) => tool_result(
                 json!({
-                    "schemaVersion": "mcpd.error.v1",
+                    "schemaVersion": "flr.error.v1",
                     "reasonCode": error.code,
                     "stage": error.stage,
                     "retryable": error.retryable,

@@ -1,12 +1,12 @@
 ---
-name: mcpd-sdk
-description: Embed mcp-dispatcher as a Rust library — build registrations in code and serve MCP over stdio or the authenticated loopback transport.
+name: flr-sdk
+description: Embed fairliny-registrar as a Rust library — build registrations in code and serve MCP over stdio or the authenticated loopback transport.
 ---
 
-# Embedding MCP-Dispatcher as an SDK
+# Embedding Fairliny-Registrar as an SDK
 
 Use this when the host is Rust and wants to own the process: no TOML, no
-`mcpd` binary, registrations built in code.
+`flr` binary, registrations built in code.
 
 ## The shape
 
@@ -71,7 +71,7 @@ Protocol negotiation: primary revision `2025-06-18`, compatible
 
 ## Rules
 
-- The engine owns JSON-RPC error shape and `mcpd.error.v1` payloads;
+- The engine owns JSON-RPC error shape and `flr.error.v1` payloads;
   handlers return `Ok(value)` or `Err(McpApplicationError)` — never raw
   transport errors.
 - Do not give a handler its own view of authentication; trust

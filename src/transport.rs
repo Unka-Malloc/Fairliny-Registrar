@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const DISCOVERY_SCHEMA: &str = "mcpd.discovery.v1";
+const DISCOVERY_SCHEMA: &str = "flr.discovery.v1";
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_CONNECTIONS: usize = 32;
 const MAX_SESSIONS: usize = 64;
@@ -106,7 +106,7 @@ impl HttpService {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         if !address.ip().is_loopback() {
-            return Err(anyhow!("mcpd_loopback_required"));
+            return Err(anyhow!("flr_loopback_required"));
         }
         for field in &context_fields {
             field.validate()?;
@@ -161,7 +161,7 @@ impl HttpService {
                 .min()
                 .and_then(|provider| tokens.get(provider))
                 .cloned()
-                .ok_or_else(|| anyhow!("mcpd_unavailable"))?,
+                .ok_or_else(|| anyhow!("flr_unavailable"))?,
             context_headers: Vec::new(),
             effect_tools: Vec::new(),
         };
@@ -183,7 +183,7 @@ impl HttpService {
         });
         let thread_stop = Arc::clone(&stop);
         let thread = match thread::Builder::new()
-            .name("mcpd-http".to_owned())
+            .name("flr-http".to_owned())
             .spawn(move || serve(listener, service, thread_stop))
         {
             Ok(thread) => thread,
@@ -239,7 +239,7 @@ impl HttpService {
                 serde_json::json!({
                     "protocolVersion": definition.protocol_revision,
                     "capabilities": {},
-                    "clientInfo": {"name": "mcpd-supervisor-health", "version": "1"}
+                    "clientInfo": {"name": "flr-supervisor-health", "version": "1"}
                 })
                 .as_object()
                 .cloned()
@@ -444,7 +444,7 @@ fn serve(listener: TcpListener, service: Arc<ServiceState>, stop: Arc<AtomicBool
                 }
                 let request_service = Arc::clone(&service);
                 if thread::Builder::new()
-                    .name("mcpd-request".to_owned())
+                    .name("flr-request".to_owned())
                     .spawn(move || {
                         let _permit = ConnectionPermit(&request_service.active_connections);
                         let _ = handle_connection(stream, &request_service);
@@ -885,10 +885,10 @@ fn write_discovery(path: &Path, document: &DiscoveryDocument) -> Result<()> {
 
 pub(crate) fn read_discovery(path: &Path) -> Result<DiscoveryDocument> {
     let text = private_state::read_existing_private_text_bounded(path, 16 * 1024)?
-        .ok_or_else(|| anyhow!("mcpd_discovery_unavailable"))?;
+        .ok_or_else(|| anyhow!("flr_discovery_unavailable"))?;
     let document: DiscoveryDocument = serde_json::from_str(&text)?;
     if !valid_discovery_document(&document) {
-        return Err(anyhow!("mcpd_discovery_invalid"));
+        return Err(anyhow!("flr_discovery_invalid"));
     }
     Ok(document)
 }
@@ -968,8 +968,8 @@ pub enum ConnectorDiscoveryError {
 impl ConnectorDiscoveryError {
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::Unavailable => "mcpd_discovery_unavailable",
-            Self::CallerNotSupported(_) => "mcpd_caller_unsupported",
+            Self::Unavailable => "flr_discovery_unavailable",
+            Self::CallerNotSupported(_) => "flr_caller_unsupported",
         }
     }
 }
@@ -1111,7 +1111,7 @@ pub fn connector_exchange(
     definition: &McpServerDefinition,
 ) -> Result<(u16, Option<String>, Vec<u8>)> {
     if !definition.supports_protocol_revision(protocol_revision) {
-        return Err(anyhow!("mcpd_protocol_revision_invalid"));
+        return Err(anyhow!("flr_protocol_revision_invalid"));
     }
     exchange(
         discovery,
@@ -1128,8 +1128,8 @@ pub fn connector_exchange(
     )
     .map_err(|failure| {
         anyhow!(match failure {
-            ExchangeFailure::Transport => "mcpd_connector_transport_failed",
-            ExchangeFailure::ResponseTooLarge => "mcpd_connector_response_too_large",
+            ExchangeFailure::Transport => "flr_connector_transport_failed",
+            ExchangeFailure::ResponseTooLarge => "flr_connector_response_too_large",
         })
     })
 }
@@ -1151,7 +1151,7 @@ pub fn connector_close_session(discovery: &ConnectorDiscovery, session_id: &str)
         .call();
     match response {
         Ok(response) if response.status() == 204 => Ok(()),
-        _ => Err(anyhow!("mcpd_connector_close_failed")),
+        _ => Err(anyhow!("flr_connector_close_failed")),
     }
 }
 
@@ -1180,8 +1180,8 @@ fn health_exchange(
     )
     .map_err(|failure| {
         anyhow!(match failure {
-            ExchangeFailure::Transport => "mcpd_health_transport_failed",
-            ExchangeFailure::ResponseTooLarge => "mcpd_health_response_too_large",
+            ExchangeFailure::Transport => "flr_health_transport_failed",
+            ExchangeFailure::ResponseTooLarge => "flr_health_response_too_large",
         })
     })
 }
@@ -1311,7 +1311,7 @@ mod tests {
     /// caller holds `STATE_ROOT_TEST_LOCK` for the whole test.
     fn fixture_root(name: &str) -> PathBuf {
         let root =
-            std::env::temp_dir().join(format!("mcpd-{name}-{}", uuid::Uuid::new_v4().simple()));
+            std::env::temp_dir().join(format!("flr-{name}-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
         crate::private_state::set_state_root_override(root.clone());

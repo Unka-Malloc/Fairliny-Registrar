@@ -1,9 +1,9 @@
 ---
-name: mcpd-sidecar
-description: Run mcpd as a managed sidecar — declarative services.toml, lifecycle control, and connector wiring for MCP callers.
+name: flr-sidecar
+description: Run flr as a managed sidecar — declarative services.toml, lifecycle control, and connector wiring for MCP callers.
 ---
 
-# Running `mcpd` as a sidecar
+# Running `flr` as a sidecar
 
 Use this when the host is not Rust, or wants the dispatcher isolated in its
 own process serving declaratively-registered tool services.
@@ -15,7 +15,7 @@ own process serving declaratively-registered tool services.
   `[[service.tools]]`). Validated before anything binds: duplicate tool
   names across services, unknown `control` entries, non-closed schemas and
   malformed backends all fail startup.
-- State root — resolves as `--home`, then `MCPD_HOME`, then the platform
+- State root — resolves as `--home`, then `FLR_HOME`, then the platform
   user-data dir. Holds owner-only `discovery.json` (endpoint, generation,
   per-caller bearer tokens). Every command touching a running sidecar needs
   the same state root.
@@ -23,11 +23,11 @@ own process serving declaratively-registered tool services.
 ## Lifecycle
 
 ```sh
-mcpd serve --config services.toml            # foreground (supervisors)
-mcpd service start --config services.toml    # detached
-mcpd service status                          # {"service":"mcpd","state":"running"}
-mcpd service reload --config services.toml   # new generation, live swap
-mcpd service stop                            # withdraws discovery
+flr serve --config services.toml            # foreground (supervisors)
+flr service start --config services.toml    # detached
+flr service status                          # {"service":"flr","state":"running"}
+flr service reload --config services.toml   # new generation, live swap
+flr service stop                            # withdraws discovery
 ```
 
 `status` is a real health probe — authenticated initialize plus the exact
@@ -40,7 +40,7 @@ withdraws it.
 Each admitted caller runs its own bridge:
 
 ```sh
-mcpd connector --caller <provider>
+flr connector --caller <provider>
 ```
 
 The caller's MCP client speaks ordinary stdio JSON-RPC to the connector.
@@ -64,7 +64,7 @@ is never resent — it reports `mcp_outcome_unknown` (below).
   call that never left reports `mcp_module_unavailable` (`retryable=true`).
   Never re-send an uncertain call.
 
-## Backend contract (`mcpd.stdio.v1`-style)
+## Backend contract (`flr.stdio.v1`-style)
 
 `[service.backend]` spawns `program args`, then sends `invoke` argv with
 the literal `{request}` replaced by the JSON tool request on the child's

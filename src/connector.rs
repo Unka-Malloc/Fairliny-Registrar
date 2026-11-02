@@ -27,11 +27,11 @@ const MAX_IN_FLIGHT_FRAMES: usize = 32;
 /// Stdout carries protocol frames only, so every startup refusal is reported
 /// on stderr. Without one the client sees a bare transport-level connection
 /// close and reads a refused caller as a connectivity fault.
-const DIAGNOSTIC_PREFIX: &str = "mcpd";
+const DIAGNOSTIC_PREFIX: &str = "flr";
 
 /// The environment variable a caller may declare its provider id through,
 /// instead of `--caller`.
-const CALLER_ENV: &str = "MCPD_CALLER";
+const CALLER_ENV: &str = "FLR_CALLER";
 
 /// The wire contract this connector speaks: the crate's fixed revision set
 /// and frame bound as one `McpServerDefinition`, so the client checks the
@@ -41,7 +41,7 @@ fn connector_definition() -> McpServerDefinition {
     McpServerDefinition {
         protocol_revision: PROTOCOL_REVISION,
         compatible_protocol_revisions: COMPATIBLE_PROTOCOL_REVISIONS,
-        server_name: "mcpd-connector",
+        server_name: "flr-connector",
         server_version: env!("CARGO_PKG_VERSION"),
         max_message_bytes: MAX_MCP_FRAME_BYTES,
     }
@@ -597,7 +597,7 @@ mod tests {
         let supported = vec!["codex".to_owned(), "cursor".to_owned()];
         let undeclared = CallerRejection::Undeclared.describe(&supported);
         assert!(undeclared.contains("is not declared"), "{undeclared}");
-        assert!(undeclared.contains("MCPD_CALLER"), "{undeclared}");
+        assert!(undeclared.contains("FLR_CALLER"), "{undeclared}");
         assert!(
             undeclared.contains("(supported: codex, cursor)"),
             "{undeclared}"
@@ -762,8 +762,7 @@ mod tests {
         let _serial = crate::private_state::STATE_ROOT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let root =
-            std::env::temp_dir().join(format!("mcpd-heal-{}", uuid::Uuid::new_v4().simple()));
+        let root = std::env::temp_dir().join(format!("flr-heal-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
         crate::private_state::set_state_root_override(root.clone());

@@ -1,6 +1,6 @@
 //! Local lifecycle control for this executable, independent of the host.
 //!
-//! `service start` spawns the same `mcpd serve` entry an operator may run in
+//! `service start` spawns the same `flr serve` entry an operator may run in
 //! the foreground; the OS lease under the state root proves which generation
 //! is live, and `stop` delivers the control-token stop then drains without an
 //! arbitrary deadline.
@@ -27,7 +27,7 @@ use std::{
 /// hands that digest to the program it starts. A serving process that finds
 /// a different digest on itself refuses to serve: the payload that comes up
 /// is the byte-identical one the operator approved, or it is nothing.
-const APPROVED_DIGEST_ENV: &str = "MCPD_APPROVED_DIGEST";
+const APPROVED_DIGEST_ENV: &str = "FLR_APPROVED_DIGEST";
 
 /// The largest executable this process will read to measure itself.
 const MAX_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -95,7 +95,7 @@ fn status() -> Value {
             .ok()
             .is_some_and(|discovery| transport::connector_health(&discovery))
     });
-    json!({"service":"mcpd","state":if running {"running"} else {"stopped"}})
+    json!({"service":"flr","state":if running {"running"} else {"stopped"}})
 }
 fn service_lease_held() -> bool {
     let Ok(root) = private_state::state_root_read_only() else {
@@ -136,13 +136,13 @@ fn clean_stale_generation(generation: &str) {
     }
 }
 
-/// The serve-child argv: `mcpd serve --config <path>` plus `--home` when the
+/// The serve-child argv: `flr serve --config <path>` plus `--home` when the
 /// caller installed an explicit state root, so the child resolves the same
 /// root this process did.
 fn serve_args(config: &Path) -> Result<Vec<String>> {
     let config = config
         .canonicalize()
-        .map_err(|_| anyhow!("mcpd_config_unavailable"))?;
+        .map_err(|_| anyhow!("flr_config_unavailable"))?;
     let mut args = vec![
         "serve".to_owned(),
         "--config".to_owned(),
@@ -234,10 +234,10 @@ fn stop() -> Result<Value> {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Ok(json!({"service":"mcpd","state":"stopped"}))
+    Ok(json!({"service":"flr","state":"stopped"}))
 }
 
-/// The supervised entry: `mcpd serve --config <services.toml>` in the
+/// The supervised entry: `flr serve --config <services.toml>` in the
 /// foreground or as the detached child `service start` spawned. Consent
 /// before serving — the process that answers callers is the approved
 /// payload, or it does not come up at all.
@@ -265,10 +265,10 @@ pub fn serve(config: &Path) -> Result<Value> {
     }
     drop(service);
     drop(lease);
-    Ok(json!({"service":"mcpd","state":"stopped"}))
+    Ok(json!({"service":"flr","state":"stopped"}))
 }
 
-/// `mcpd service start|stop|status|reload`. `start` and `reload` need the
+/// `flr service start|stop|status|reload`. `start` and `reload` need the
 /// registration file; `stop` and `status` resolve the running generation
 /// from published discovery alone.
 pub fn execute(action: &str, config: Option<&Path>) -> Result<Value> {
@@ -280,7 +280,7 @@ pub fn execute(action: &str, config: Option<&Path>) -> Result<Value> {
             stop()?;
             start(config)
         }
-        ("start" | "reload", None) => Err(anyhow!("mcpd_config_required")),
+        ("start" | "reload", None) => Err(anyhow!("flr_config_required")),
         _ => Err(anyhow!("mcp_lifecycle_invalid")),
     }
 }
@@ -291,11 +291,11 @@ mod tests {
 
     fn fixture(tag: &str, content: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
         let root = env::temp_dir().join(format!(
-            "mcpd-lifecycle-{tag}-{}",
+            "flr-lifecycle-{tag}-{}",
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&root).expect("fixture root");
-        let payload = root.join("mcpd");
+        let payload = root.join("flr");
         fs::write(&payload, content).expect("fixture payload");
         (root, payload)
     }

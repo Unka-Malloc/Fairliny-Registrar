@@ -1,4 +1,4 @@
-# Agent rules for MCP-Dispatcher
+# Agent rules for Fairliny-Registrar
 
 ## Boundary (hard rule)
 

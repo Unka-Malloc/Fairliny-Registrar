@@ -1,12 +1,12 @@
-//! `mcpd` — serve declaratively-registered tool services over authenticated
+//! `flr` — serve declaratively-registered tool services over authenticated
 //! MCP, bridge callers to them over stdio, and control the local lifecycle.
 //!
 //! ```text
-//! mcpd serve --config <services.toml> [--home <dir>]
-//! mcpd service start --config <services.toml> [--home <dir>]
-//! mcpd service stop|status [--home <dir>]
-//! mcpd service reload --config <services.toml> [--home <dir>]
-//! mcpd connector --caller <provider> [--home <dir>]
+//! flr serve --config <services.toml> [--home <dir>]
+//! flr service start --config <services.toml> [--home <dir>]
+//! flr service stop|status [--home <dir>]
+//! flr service reload --config <services.toml> [--home <dir>]
+//! flr connector --caller <provider> [--home <dir>]
 //! ```
 //!
 //! `serve` is the supervised entry: it checks the approved-payload consent,
@@ -14,9 +14,9 @@
 //! discovery and serves the union catalog on numeric loopback. `service
 //! start` spawns that same entry detached. `connector` is the thin stdio
 //! bridge an MCP caller process runs. The state root resolves as `--home`,
-//! then `MCPD_HOME`, then the platform user-data directory.
+//! then `FLR_HOME`, then the platform user-data directory.
 
-use mcp_dispatcher::{connector, lifecycle, private_state};
+use fairliny_registrar::{connector, lifecycle, private_state};
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,11 +24,11 @@ use std::process::ExitCode;
 fn usage() {
     eprintln!(
         "usage:\n  \
-         mcpd serve --config <services.toml> [--home <dir>]\n  \
-         mcpd service start --config <services.toml> [--home <dir>]\n  \
-         mcpd service stop|status [--home <dir>]\n  \
-         mcpd service reload --config <services.toml> [--home <dir>]\n  \
-         mcpd connector --caller <provider> [--home <dir>]"
+         flr serve --config <services.toml> [--home <dir>]\n  \
+         flr service start --config <services.toml> [--home <dir>]\n  \
+         flr service stop|status [--home <dir>]\n  \
+         flr service reload --config <services.toml> [--home <dir>]\n  \
+         flr connector --caller <provider> [--home <dir>]"
     );
 }
 
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
-                    eprintln!("mcpd: {error}");
+                    eprintln!("flr: {error}");
                     ExitCode::FAILURE
                 }
             }
@@ -110,7 +110,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
-                    eprintln!("mcpd: {error}");
+                    eprintln!("flr: {error}");
                     ExitCode::FAILURE
                 }
             }

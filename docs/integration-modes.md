@@ -1,17 +1,17 @@
 # Integration modes
 
-MCP-Dispatcher serves one union catalog three ways. All modes share the
+Fairliny-Registrar serves one union catalog three ways. All modes share the
 same engine, the same admission rules and the same collision-fails-closed
 registration semantics; they differ only in who builds the registrations
 and which transport faces the caller.
 
 ## 1. Embedded Rust SDK
 
-A Rust host links `mcp-dispatcher`, builds `Registration`s in code and
+A Rust host links `fairliny-registrar`, builds `Registration`s in code and
 serves them directly — no TOML, no child config parsing.
 
 ```rust,no_run
-use mcp_dispatcher::{
+use fairliny_registrar::{
     CallerContext, COMPATIBLE_PROTOCOL_REVISIONS, Dispatcher, InProcessBackend,
     MAX_MCP_FRAME_BYTES, McpServerDefinition, McpServerEngine, PROTOCOL_REVISION,
     Registration, ToolSpec, serve_stdio,
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
   boundary, hand the same `(McpServerDefinition, Dispatcher)` pair to
   `transport::HttpService::start`.
 
-## 2. `mcpd serve` sidecar
+## 2. `flr serve` sidecar
 
 A host that is not Rust — or that wants process isolation — declares its
 services in TOML and runs the binary:
@@ -128,16 +128,16 @@ input_schema_json = '''
 Then:
 
 ```sh
-MCPD_HOME=<state dir> mcpd service start --config services.toml
-MCPD_HOME=<state dir> mcpd service status    # {"service":"mcpd","state":"running"}
-MCPD_HOME=<state dir> mcpd service reload --config services.toml
-MCPD_HOME=<state dir> mcpd service stop
+FLR_HOME=<state dir> flr service start --config services.toml
+FLR_HOME=<state dir> flr service status    # {"service":"flr","state":"running"}
+FLR_HOME=<state dir> flr service reload --config services.toml
+FLR_HOME=<state dir> flr service stop
 ```
 
 Each admitted caller connects through its own connector process:
 
 ```sh
-MCPD_HOME=<state dir> mcpd connector --caller caller-a
+FLR_HOME=<state dir> flr connector --caller caller-a
 ```
 
 The caller's MCP client talks ordinary stdio JSON-RPC to the connector;
@@ -175,5 +175,5 @@ world effect.
 | You are...                          | Mode |
 |-------------------------------------|------|
 | A Rust host owning the process      | Embedded SDK (`InProcessBackend` or `NativeBackend`) |
-| Any host wanting a managed sidecar  | `mcpd` + `services.toml` |
+| Any host wanting a managed sidecar  | `flr` + `services.toml` |
 | Reusing an existing admitted surface | Copy a preset, adjust callers/backends |
